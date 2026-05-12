@@ -5,6 +5,14 @@ Pala One is a tiny DIY E-Ink reader built around the Heltec Wireless Paper (ESP3
 
 The goal of the project was to create a simple, distraction-free reading device that feels minimal, portable and easy to build while still looking and behaving more like a real product than a typical DIY electronics project.
 
+## Board Versions
+
+There are currently two supported Heltec Wireless Paper versions:
+- `Heltec V1.1`
+- `Heltec V1.2`
+Please make sure to use the correct firmware version for your specific board revision.
+The board version is usually printed on the back of the PCB.
+
 ## Features
 
 - TXT book support
