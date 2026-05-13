@@ -1,8 +1,8 @@
 #include <heltec-eink-modules.h>
 
 // ── Board selection: uncomment the line that matches your hardware ────────────
-// #define BOARD_V1_1
-#define BOARD_V1_2
+#define BOARD_V1_1
+// #define BOARD_V1_2
 // ─────────────────────────────────────────────────────────────────────────────
 #ifdef BOARD_V1_1
   using DisplayType = EInkDisplay_WirelessPaperV1_1;
