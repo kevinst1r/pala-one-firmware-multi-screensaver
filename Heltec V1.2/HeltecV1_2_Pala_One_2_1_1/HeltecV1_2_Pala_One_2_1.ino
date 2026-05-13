@@ -3379,6 +3379,26 @@ static int parseSleepSlotArg(const String& argValue) {
   return slot;
 }
 
+static int loadSleepCycleIndex() {
+  File f = FS.open("/sleep-cycle.idx", "r");
+  if (!f) return 0;
+  String s = f.readString();
+  f.close();
+  s.trim();
+  if (s.length() == 0) return 0;
+  int v = s.toInt();
+  if (v < 0) v = 0;
+  return v;
+}
+
+static void saveSleepCycleIndex(int idx) {
+  if (idx < 0) idx = 0;
+  File f = FS.open("/sleep-cycle.idx", "w");
+  if (!f) return;
+  f.print(String(idx));
+  f.close();
+}
+
 static uint8_t reverseBits8(uint8_t b) {
   b = (uint8_t)(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
   b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
@@ -3594,6 +3614,7 @@ static void handleSettingsPost() {
     if (server.hasArg("ssreset")) {
       prefs.putUInt("cfg_sleep_ss_idx", 0);
       prefs.putInt("cfg_ss_last_slot", -1);
+      saveSleepCycleIndex(0);
     }
   }
 
@@ -3618,6 +3639,7 @@ static void handleDeleteSleepImg() {
   if (FS.exists("/sleep.bin")) FS.remove("/sleep.bin");
   prefs.putUInt("cfg_sleep_ss_idx", 0);
   prefs.putInt("cfg_ss_last_slot", -1);
+  saveSleepCycleIndex(0);
   server.sendHeader("Location", "/settings");
   server.send(302, "text/plain", "");
 }
@@ -3698,6 +3720,7 @@ static void handleSleepSlotRemove() {
   }
   prefs.putUInt("cfg_sleep_ss_idx", 0);
   prefs.putInt("cfg_ss_last_slot", -1);
+  saveSleepCycleIndex(0);
   server.sendHeader("Location", "/settings");
   server.send(302, "text/plain", "");
 }
@@ -3875,6 +3898,7 @@ static void handleUploadSleepStream() {
           g_upload.sleepOk = true;
           prefs.putUInt("cfg_sleep_ss_idx", 0);
           prefs.putInt("cfg_ss_last_slot", -1);
+          saveSleepCycleIndex(0);
         } else {
           if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
           g_upload.sleepError = "Failed to save rotation image";
@@ -4061,9 +4085,14 @@ static void drawSleepScreen() {
       }
       prefs.putInt("cfg_ss_last_slot", slotPick);
     } else {
-      uint32_t idx = prefs.getUInt("cfg_sleep_ss_idx", 0) % (uint32_t)slotCount;
-      slotPick = slots[idx];
-      prefs.putUInt("cfg_sleep_ss_idx", idx + 1);
+      // Cycle mode: drive from a small persisted index file to guarantee
+      // advancement across deep-sleep restarts on all boards.
+      int idx = loadSleepCycleIndex();
+      if (idx < 0) idx = 0;
+      slotPick = slots[idx % slotCount];
+      int nextIdx = (idx + 1) % slotCount;
+      saveSleepCycleIndex(nextIdx);
+      prefs.putInt("cfg_ss_last_slot", slotPick);
     }
 
     File mf = FS.open(sleepSlotPath(slotPick), "r");
