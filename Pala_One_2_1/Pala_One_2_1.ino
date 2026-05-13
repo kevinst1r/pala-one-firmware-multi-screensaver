@@ -4,6 +4,14 @@
 #define BOARD_V1_1
 // #define BOARD_V1_2
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ── Apps: comment out any app you don't want compiled into the firmware ───────
+#define APP_CLICK_COUNTER
+// ─────────────────────────────────────────────────────────────────────────────
+// Add each new app to this OR chain so the Apps menu entry appears automatically
+#if defined(APP_CLICK_COUNTER)
+#  define ANY_APP_DEFINED
+#endif
 #ifdef BOARD_V1_1
   using DisplayType = EInkDisplay_WirelessPaperV1_1;
 #else
@@ -95,8 +103,12 @@ enum Mode {
   MODE_BM_BOOK_SELECT,
   MODE_BM_LIST,
   MODE_BM_PREVIEW,
+#ifdef ANY_APP_DEFINED
   MODE_APPS,
-  MODE_CLICK_COUNTER
+#endif
+#ifdef APP_CLICK_COUNTER
+  MODE_CLICK_COUNTER,
+#endif
 };
 
 enum ReaderLongPressAction {
@@ -111,7 +123,9 @@ enum LibraryEntryType {
   LIB_ENTRY_LIST,
   LIB_ENTRY_ABOUT,
   LIB_ENTRY_UPLOAD,
-  LIB_ENTRY_APPS
+#ifdef ANY_APP_DEFINED
+  LIB_ENTRY_APPS,
+#endif
 };
 
 struct BookInfo {
@@ -295,8 +309,12 @@ uint32_t g_offsetCacheStamp = 1;
 
 uint32_t lastUserActionMs = 0;
 int menuDrawsSinceFull = 0;
+#ifdef ANY_APP_DEFINED
 static int g_appsSelectedIndex = 0;
+#endif
+#ifdef APP_CLICK_COUNTER
 static int g_clickCounter = 0;
+#endif
 LayoutMetrics g_metrics;
 bool g_metricsValid = false;
 
@@ -1230,7 +1248,9 @@ static String libraryEntryLabel(int idx) {
     case LIB_ENTRY_LIST:      return "List";
     case LIB_ENTRY_ABOUT:     return "Device";
     case LIB_ENTRY_UPLOAD:    return "Upload";
+#ifdef ANY_APP_DEFINED
     case LIB_ENTRY_APPS:      return "Apps";
+#endif
   }
   return "";
 }
@@ -1294,12 +1314,14 @@ static void buildLibraryEntries() {
     g_library.entryDepths[g_library.entryCount] = 0;
     g_library.entryCount++;
   }
+#ifdef ANY_APP_DEFINED
   if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
     g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_APPS;
     g_library.entryRefs[g_library.entryCount] = -1;
     g_library.entryDepths[g_library.entryCount] = 0;
     g_library.entryCount++;
   }
+#endif
   if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
     g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_UPLOAD;
     g_library.entryRefs[g_library.entryCount] = -1;
@@ -2329,7 +2351,9 @@ static void drawLibrary() {
     bool isSystem = (g_library.entryTypes[idx] == LIB_ENTRY_BOOKMARKS ||
                      g_library.entryTypes[idx] == LIB_ENTRY_LIST ||
                      g_library.entryTypes[idx] == LIB_ENTRY_ABOUT ||
+#ifdef ANY_APP_DEFINED
                      g_library.entryTypes[idx] == LIB_ENTRY_APPS ||
+#endif
                      g_library.entryTypes[idx] == LIB_ENTRY_UPLOAD);
     bool boldText = (idx == g_library.selectedItem);
     drawMenuBulletRow(y, label, idx == g_library.selectedItem, boldText, g_library.entryDepths[idx], isSystem);
@@ -2433,6 +2457,7 @@ static void drawAbout() {
   display.update();
 }
 
+#ifdef ANY_APP_DEFINED
 static void drawAppsMenu() {
   prepareMenuFrame();
   u8g2.setFont(MAIN_FONT);
@@ -2441,8 +2466,12 @@ static void drawAppsMenu() {
   int lineH = (ascent - descent) + g_settings.lineGap + 1;
   int y = drawSectionHeader("Apps");
 
-  const char* apps[] = { "Click Counter" };
-  const int appCount = 1;
+  const char* apps[] = {
+#ifdef APP_CLICK_COUNTER
+    "Click Counter",
+#endif
+  };
+  const int appCount = (int)(sizeof(apps) / sizeof(apps[0]));
 
   for (int i = 0; i < appCount; i++) {
     bool selected = (i == g_appsSelectedIndex);
@@ -2454,7 +2483,9 @@ static void drawAppsMenu() {
 
   display.update();
 }
+#endif
 
+#ifdef APP_CLICK_COUNTER
 static void drawClickCounter() {
   prepareMenuFrame();
   u8g2.setFont(MAIN_FONT);
@@ -2471,6 +2502,7 @@ static void drawClickCounter() {
 
   display.update();
 }
+#endif
 
 static void drawBookmarksBookSelect() {
   prepareMenuFrame();
@@ -3968,23 +4000,34 @@ static void handleModeAbout() {
   }
 }
 
+#ifdef ANY_APP_DEFINED
 static void handleModeApps() {
+  const char* apps[] = {
+#ifdef APP_CLICK_COUNTER
+    "",
+#endif
+  };
+  const int appCount = (int)(sizeof(apps) / sizeof(apps[0]));
+
   if (btns.shortClick) {
-    const int appCount = 1;
     g_appsSelectedIndex = (g_appsSelectedIndex + 1) % appCount;
     drawAppsMenu();
     return;
   }
   if (btns.doubleClick) {
-    if (g_appsSelectedIndex == 0) {
-      mode = MODE_CLICK_COUNTER;
-      drawClickCounter();
-    }
+    int i = 0;
+#ifdef APP_CLICK_COUNTER
+    if (g_appsSelectedIndex == i) { mode = MODE_CLICK_COUNTER; drawClickCounter(); return; }
+    i++;
+#endif
+    (void)i;
     return;
   }
   // Triple-click handled globally → library root
 }
+#endif
 
+#ifdef APP_CLICK_COUNTER
 static void handleModeClickCounter() {
   // Fire while the button is still held — no need to release first.
   // Disarm the press so the subsequent release doesn't re-trigger.
@@ -4006,6 +4049,7 @@ static void handleModeClickCounter() {
     drawClickCounter();
   }
 }
+#endif
 
 static void handleModeBookmarkBookSelect() {
   if (btns.tripleClick) {
@@ -4202,12 +4246,14 @@ static void handleModeLibrary() {
     return;
   }
 
+#ifdef ANY_APP_DEFINED
   if (entryType == LIB_ENTRY_APPS) {
     g_appsSelectedIndex = 0;
     mode = MODE_APPS;
     drawAppsMenu();
     return;
   }
+#endif
 
   startUploadMode();
 }
@@ -4325,7 +4371,10 @@ void loop() {
       && mode != MODE_BM_PREVIEW
       && mode != MODE_BM_LIST
       && mode != MODE_BM_BOOK_SELECT
-      && mode != MODE_CLICK_COUNTER) {
+#ifdef APP_CLICK_COUNTER
+      && mode != MODE_CLICK_COUNTER
+#endif
+      ) {
     enterLibraryRoot(true);
     markUserActivity();
     return;
@@ -4335,8 +4384,12 @@ void loop() {
     case MODE_UPLOAD:         handleModeUpload(); break;
     case MODE_ABOUT:          handleModeAbout(); break;
     case MODE_LIST:           handleModeList(); break;
+#ifdef ANY_APP_DEFINED
     case MODE_APPS:           handleModeApps(); break;
+#endif
+#ifdef APP_CLICK_COUNTER
     case MODE_CLICK_COUNTER:  handleModeClickCounter(); break;
+#endif
     case MODE_BM_BOOK_SELECT: handleModeBookmarkBookSelect(); break;
     case MODE_BM_LIST:        handleModeBookmarkList(); break;
     case MODE_BM_PREVIEW:     handleModeBookmarkPreview(); break;
