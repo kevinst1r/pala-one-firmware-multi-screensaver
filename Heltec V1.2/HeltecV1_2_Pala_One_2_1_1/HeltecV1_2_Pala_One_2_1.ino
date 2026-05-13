@@ -124,6 +124,7 @@ struct RuntimeSettings {
   int fontSize = 8;
   uint32_t sleepSecs = 120;
   int lineGap = 0;
+  bool bionicReading = false;
   int readerLongPressAction = LONGPRESS_BOOKMARK;
 };
 
@@ -437,6 +438,7 @@ static void loadSettings() {
   g_settings.lineGap = prefs.getInt("cfg_lgap", 0);
   if (g_settings.lineGap < 0) g_settings.lineGap = 0;
   if (g_settings.lineGap > 4) g_settings.lineGap = 4;
+  g_settings.bionicReading = (prefs.getInt("cfg_bionic", 0) == 1);
 
   g_settings.readerLongPressAction = LONGPRESS_BOOKMARK;
   invalidateMetrics();
@@ -1857,6 +1859,101 @@ static bool lineEndsWithSpace(const String& s) {
   return s.length() > 0 && s[s.length() - 1] == ' ';
 }
 
+static bool isBionicWordLeadByte(uint8_t b) {
+  return (b >= '0' && b <= '9') ||
+         (b >= 'A' && b <= 'Z') ||
+         (b >= 'a' && b <= 'z') ||
+         (b >= 128);
+}
+
+static int utf8CharCount(const String& s) {
+  int count = 0;
+  for (int i = 0; i < (int)s.length();) {
+    int clen = utf8SafeCharLenAt(s, i);
+    if (clen <= 0) clen = 1;
+    i += clen;
+    count++;
+  }
+  return count;
+}
+
+static int bionicStrongCharsForWord(int charCount) {
+  if (charCount <= 0) return 0;
+  if (charCount <= 3) return 1;
+  int strong = charCount / 2;
+  if (strong < 1) strong = 1;
+  if (strong > 4) strong = 4;
+  return strong;
+}
+
+static int utf8ByteOffsetForCharCount(const String& s, int charCount) {
+  if (charCount <= 0) return 0;
+  int i = 0;
+  int seen = 0;
+  while (i < (int)s.length() && seen < charCount) {
+    int clen = utf8SafeCharLenAt(s, i);
+    if (clen <= 0) clen = 1;
+    i += clen;
+    seen++;
+  }
+  return i;
+}
+
+static void drawReaderLineText(const String& text, int x, int yBaseline) {
+  if (!g_settings.bionicReading) {
+    u8g2.setFont(MAIN_FONT);
+    u8g2.setCursor(x, yBaseline);
+    u8g2.print(text.c_str());
+    return;
+  }
+
+  int cursorX = x;
+  int i = 0;
+  while (i < (int)text.length()) {
+    int segStart = i;
+    bool isSpace = (text[i] == ' ');
+    while (i < (int)text.length() && ((text[i] == ' ') == isSpace)) i++;
+    String seg = text.substring(segStart, i);
+    if (seg.length() == 0) continue;
+
+    if (isSpace) {
+      u8g2.setFont(MAIN_FONT);
+      u8g2.setCursor(cursorX, yBaseline);
+      u8g2.print(seg.c_str());
+      cursorX += u8g2.getUTF8Width(seg.c_str());
+      continue;
+    }
+
+    uint8_t lead = (uint8_t)seg[0];
+    int chars = utf8CharCount(seg);
+    int strongChars = bionicStrongCharsForWord(chars);
+    int strongBytes = utf8ByteOffsetForCharCount(seg, strongChars);
+
+    if (!isBionicWordLeadByte(lead) || strongBytes <= 0 || strongBytes >= (int)seg.length()) {
+      u8g2.setFont(MAIN_FONT);
+      u8g2.setCursor(cursorX, yBaseline);
+      u8g2.print(seg.c_str());
+      cursorX += u8g2.getUTF8Width(seg.c_str());
+      continue;
+    }
+
+    String strong = seg.substring(0, strongBytes);
+    String rest = seg.substring(strongBytes);
+
+    u8g2.setFont(BOLD_FONT);
+    u8g2.setCursor(cursorX, yBaseline);
+    u8g2.print(strong.c_str());
+    cursorX += u8g2.getUTF8Width(strong.c_str());
+
+    u8g2.setFont(MAIN_FONT);
+    u8g2.setCursor(cursorX, yBaseline);
+    u8g2.print(rest.c_str());
+    cursorX += u8g2.getUTF8Width(rest.c_str());
+  }
+
+  u8g2.setFont(MAIN_FONT);
+}
+
 // ============================================================================
 //  Pagination / text layout
 // ============================================================================
@@ -1881,8 +1978,7 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
     trimTrailingSpaces(printable);
 
     if (draw) {
-      u8g2.setCursor(MARGIN_X, cursorY);
-      u8g2.print(printable.c_str());
+      drawReaderLineText(printable, MARGIN_X, cursorY);
       cursorY += m.lineH;
     }
     if (outText) {
@@ -3423,6 +3519,7 @@ static void handleSettings() {
   String lg1 = (g_settings.lineGap == 1) ? " selected" : "";
   String lg2 = (g_settings.lineGap == 2) ? " selected" : "";
   String lg3 = (g_settings.lineGap == 3) ? " selected" : "";
+  String bionicChecked = g_settings.bionicReading ? " checked" : "";
 
   // Any /sleep.bin counts as "custom" for the web UI (legacy single-image mode).
   bool hasSleepImg = FS.exists("/sleep.bin");
@@ -3485,6 +3582,9 @@ static void handleSettings() {
   out += "<option value='3'"; out += lg3; out += ">3 px &mdash; loose</option>";
   out +=
     "</select><div class='hint'>A small change here can make text much easier to scan.</div></div>"
+    "<div><label for='bionic'>Reading style</label><label style='display:flex;gap:10px;align-items:flex-start;font-weight:400;margin-top:10px'><input id='bionic' type='checkbox' name='bionic' value='1'";
+  out += bionicChecked;
+  out += "><span>Enable Bionic Reading (bold word starts for faster scanning).</span></label></div>"
     "</div>"
     "<div class='actions' style='margin-top:24px;'><button type='submit'>Save settings</button><span class='muted'>No extra files, scripts, or fonts.</span></div></form></div>";
 
@@ -3570,6 +3670,7 @@ static void handleSettings() {
 
 static void handleSettingsPost() {
   bool layoutChanged = false;
+  bool readerStyleChanged = false;
 
   if (server.hasArg("font")) {
     int fs = server.arg("font").toInt();
@@ -3603,6 +3704,16 @@ static void handleSettingsPost() {
     }
   }
 
+  bool hasReadingSettingsArgs = server.hasArg("font") || server.hasArg("sleep") || server.hasArg("lgap") || server.hasArg("bionic");
+  if (hasReadingSettingsArgs) {
+    bool bionicEnabled = server.hasArg("bionic");
+    if (bionicEnabled != g_settings.bionicReading) {
+      g_settings.bionicReading = bionicEnabled;
+      prefs.putInt("cfg_bionic", bionicEnabled ? 1 : 0);
+      readerStyleChanged = true;
+    }
+  }
+
   if (server.hasArg("sscfg")) {
     bool multiEnabled = server.hasArg("ssmulti");
     prefs.putInt("cfg_ss_multi", multiEnabled ? 1 : 0);
@@ -3628,6 +3739,10 @@ static void handleSettingsPost() {
       mode = MODE_READER;
       renderCurrentPage();
     }
+  } else if (readerStyleChanged && (mode == MODE_READER || mode == MODE_BM_PREVIEW)) {
+    g_bookmarkUi.previewActive = false;
+    mode = MODE_READER;
+    renderCurrentPage();
   }
 
   server.sendHeader("Location", "/settings");
