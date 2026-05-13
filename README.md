@@ -30,6 +30,26 @@ The board version is usually printed on the back of the PCB.
 - Lightweight portable design
 - Open-source firmware
 
+## Fork Updates (Firmware 2.1.1)
+
+This fork includes an expanded screensaver system for the Heltec V1.2 firmware:
+
+- Single and multi screensaver modes in the WebUI Settings page
+- Mode-specific UI (single mode and multi mode are shown separately)
+- Multi-screensaver rotation list with per-image thumbnail previews
+- Add/remove images from rotation directly in WebUI
+- Rotation order options: cycle or shuffle
+- Shuffle avoids immediate back-to-back repeats
+- Single custom screensaver also shows a thumbnail with inline remove action
+- Screensaver thumbnails are generated on-device using the same bitmap pipeline as displayed images
+
+### Multi-screensaver behavior
+
+- Multi mode stores rotation images in slot files (`/sleep-slot-0.bin`, etc.)
+- Each rotation image must be raw XBM bytes, exactly `3904` bytes (`250x122`, 1-bit, LSB-first)
+- Single mode uses `/sleep.bin`
+- If multi mode is enabled and rotation slots exist, the single custom image is ignored until single mode is re-enabled
+
 ## Hardware
 
 Pala One is based on:
