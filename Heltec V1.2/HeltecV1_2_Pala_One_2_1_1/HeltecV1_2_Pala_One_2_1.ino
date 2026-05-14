@@ -70,6 +70,9 @@ static const uint8_t* PAGE_FONT = u8g2_font_5x8_tf;
 const uint8_t* MAIN_FONT = u8g2_font_helvR08_te;
 const uint8_t* BOLD_FONT = u8g2_font_helvB08_te;
 
+// Extra horizontal advance after the bold bionic prefix (not a space glyph) so the regular suffix reads evenly.
+static const int BIONIC_STRONG_REST_GAP_PX = 1;
+
 #define BTN 0
 #define HAS_BATTERY 1
 #if HAS_BATTERY
@@ -122,6 +125,8 @@ struct LayoutMetrics {
 
 struct RuntimeSettings {
   int fontSize = 8;
+  // 0 = Helvetica (default), 1 = OpenDyslexia-style (Lucida Sans Unicode bitmaps in u8g2).
+  int readingFont = 0;
   uint32_t sleepSecs = 120;
   int lineGap = 0;
   bool bionicReading = false;
@@ -329,7 +334,7 @@ HeltecGFXAdapter gfx(display);
 // ============================================================================
 static void invalidateMetrics();
 static const LayoutMetrics& getMetrics();
-static void applyFontSize(int sz);
+static void applyReaderFonts(int sz);
 static void loadSettings();
 static void markUserActivity();
 static void clearButtonQueue();
@@ -354,7 +359,7 @@ static void idlePrefetchReader();
 static String pageCachePathForBook(const String& path);
 static bool loadPageOffsetCacheForBook(const String& path, size_t expectedSize);
 static void savePageOffsetCacheForBook(const String& path, size_t fileSize);
-static void invalidateAllPageCaches();
+static void invalidateAllPageCaches(uint32_t resumeFromByte);
 static uint32_t resolveBookmarkOffset(const String& path, uint16_t page, uint32_t storedOffset);
 static String readPageTextForWeb(const String& path, int page);
 
@@ -416,20 +421,34 @@ static const LayoutMetrics& getMetrics() {
   return g_metrics;
 }
 
-static void applyFontSize(int sz) {
-  switch (sz) {
-    case 8:  MAIN_FONT = u8g2_font_helvR08_te; BOLD_FONT = u8g2_font_helvB08_te; break;
-    case 10: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; break;
-    case 12: MAIN_FONT = u8g2_font_helvR12_te; BOLD_FONT = u8g2_font_helvB12_te; break;
-    case 14: MAIN_FONT = u8g2_font_helvR14_te; BOLD_FONT = u8g2_font_helvB14_te; break;
-    default: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; sz = 10; break;
-  }
+static void applyReaderFonts(int sz) {
+  if (sz != 8 && sz != 10 && sz != 12 && sz != 14) sz = 10;
   g_settings.fontSize = sz;
+
+  if (g_settings.readingFont == 1) {
+    switch (sz) {
+      case 8:  MAIN_FONT = u8g2_font_luRS08_te; BOLD_FONT = u8g2_font_luBS08_te; break;
+      case 10: MAIN_FONT = u8g2_font_luRS10_te; BOLD_FONT = u8g2_font_luBS10_te; break;
+      case 12: MAIN_FONT = u8g2_font_luRS12_te; BOLD_FONT = u8g2_font_luBS12_te; break;
+      case 14: MAIN_FONT = u8g2_font_luRS14_te; BOLD_FONT = u8g2_font_luBS14_te; break;
+      default: MAIN_FONT = u8g2_font_luRS10_te; BOLD_FONT = u8g2_font_luBS10_te; break;
+    }
+  } else {
+    switch (sz) {
+      case 8:  MAIN_FONT = u8g2_font_helvR08_te; BOLD_FONT = u8g2_font_helvB08_te; break;
+      case 10: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; break;
+      case 12: MAIN_FONT = u8g2_font_helvR12_te; BOLD_FONT = u8g2_font_helvB12_te; break;
+      case 14: MAIN_FONT = u8g2_font_helvR14_te; BOLD_FONT = u8g2_font_helvB14_te; break;
+      default: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; break;
+    }
+  }
   invalidateMetrics();
 }
 
 static void loadSettings() {
-  applyFontSize(prefs.getInt("cfg_font", 8));
+  g_settings.readingFont = prefs.getInt("cfg_read_font", 0);
+  if (g_settings.readingFont != 0 && g_settings.readingFont != 1) g_settings.readingFont = 0;
+  applyReaderFonts(prefs.getInt("cfg_font", 8));
 
   g_settings.sleepSecs = (uint32_t)prefs.getInt("cfg_sleep", 120);
   if (g_settings.sleepSecs < 10) g_settings.sleepSecs = 10;
@@ -894,7 +913,7 @@ static bool loadPageOffsetCacheForBook(const String& path, size_t expectedSize) 
 }
 
 static void savePageOffsetCacheForBook(const String& path, size_t fileSize) {
-  if (g_reader.knownPages <= 1) return;
+  if (g_reader.knownPages < 1) return;
 
   String cachePath = pageCachePathForBook(path);
   File f = FS.open(cachePath, "w");
@@ -911,13 +930,78 @@ static void savePageOffsetCacheForBook(const String& path, size_t fileSize) {
   f.close();
 }
 
-static void invalidateAllPageCaches() {
+// Byte offset where the sentence begins that contains the character at `scanTop`
+// (the first byte on the reader page). Uses . ! ? and blank-line heuristics on
+// raw UTF-8 bytes; scans backward in chunks if needed.
+static uint32_t findSentenceStartContaining(File& f, size_t fileSize, uint32_t scanTop) {
+  static const uint32_t kMaxWindow = 1024;
+  if (fileSize == 0) return 0;
+  if (scanTop > fileSize) scanTop = (uint32_t)fileSize;
+  if (scanTop == 0) return 0;
+
+  auto isWs = [](char c) -> bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+  };
+  auto isCloser = [](char c) -> bool {
+    return c == '"' || c == '\'' || c == ')' || c == ']' || c == '\xBB';
+  };
+
+  // Keep this static and modest in size so settings POST handler
+  // does not blow task stack and reboot while WebUI is active.
+  static char buf[1024];
+
+  while (scanTop > 0) {
+    uint32_t windowStart = (scanTop > kMaxWindow) ? (scanTop - kMaxWindow) : 0;
+    uint32_t winLen = scanTop - windowStart;
+    if (winLen == 0) return windowStart;
+
+    if (winLen > sizeof(buf)) winLen = (uint32_t)sizeof(buf);
+    f.seek(windowStart);
+    int n = f.readBytes(buf, winLen);
+    if (n <= 0) return windowStart;
+
+    uint32_t relTop = scanTop - windowStart;
+    uint32_t bestRel = 0;
+    bool found = false;
+
+    for (uint32_t j = 0; j < relTop; j++) {
+      char c = buf[j];
+      if (j + 1 < (uint32_t)n && c == '\n' && buf[j + 1] == '\n') {
+        uint32_t k = j + 2;
+        while (k < (uint32_t)n && isWs(buf[k])) k++;
+        if (k <= relTop) {
+          bestRel = k;
+          found = true;
+        }
+        continue;
+      }
+      if (c != '.' && c != '!' && c != '?') continue;
+
+      uint32_t k = j + 1;
+      while (k < (uint32_t)n && isCloser(buf[k])) k++;
+      while (k < (uint32_t)n && isWs(buf[k])) k++;
+      if (k <= relTop) {
+        bestRel = k;
+        found = true;
+      }
+    }
+
+    if (found || windowStart == 0) {
+      return windowStart + bestRel;
+    }
+    scanTop = windowStart;
+  }
+  return 0;
+}
+
+static void invalidateAllPageCaches(uint32_t resumeFromByte) {
+  const uint32_t kReaderResumeUnset = 0xFFFFFFFFu;
   // Page offsets are computed from the current font size and line spacing.
   // When either changes, ALL cached offsets are invalid -- both the in-memory
-  // arrays and the on-disk .bin files. We also reset the saved page index to 0
-  // for every book, because page N at font size 8 is a completely different
-  // byte position at font size 12. Keeping the old page number would cause
-  // the reader to seek to the wrong place and display garbled / missing text.
+  // arrays and the on-disk .bin files. Saved page indices are reset because page
+  // numbers are layout-dependent. Optionally, the open reader can resume from a
+  // byte offset (sentence start at the top of the prior screen) so the user
+  // does not jump to the beginning of the book.
 
   resetOffsetCache();
 
@@ -956,17 +1040,27 @@ static void invalidateAllPageCaches() {
     }
   }
 
-  // Reset the currently open book's in-memory state
+  // Reset the currently open book's in-memory state (page 0; optional byte offset).
   if (g_reader.currentBookPath.length() > 0) {
-    g_reader.pageIndex   = 0;
-    g_reader.knownPages  = 1;
-    g_reader.pageOffsets[0] = 0;
-    g_reader.eofReached  = false;
+    g_reader.pageIndex = 0;
+    g_reader.knownPages = 1;
+    g_reader.eofReached = false;
+
+    uint32_t start0 = 0;
+    if (resumeFromByte != kReaderResumeUnset && g_reader.file && !g_reader.file.isDirectory()) {
+      size_t sz = g_reader.file.size();
+      if (sz > 0) {
+        start0 = resumeFromByte;
+        if (start0 >= sz) start0 = (uint32_t)(sz - 1);
+      }
+    }
+    g_reader.pageOffsets[0] = start0;
+
     resetSaveThrottle();
-    // Persist page 0 so the next cold-open also starts from the beginning
     if (g_reader.currentBookKey.length() > 0) {
       prefs.putInt((g_reader.currentBookKey + "_p").c_str(), 0);
     }
+    storeOffsetCache(g_reader.currentBookPath, 0, start0);
   }
 }
 
@@ -1899,12 +1993,15 @@ static int utf8ByteOffsetForCharCount(const String& s, int charCount) {
   return i;
 }
 
-static void drawReaderLineText(const String& text, int x, int yBaseline) {
+// Lays out reader line text; returns total width from x. If draw, renders at yBaseline.
+static int layoutReaderLineText(const String& text, int x, int yBaseline, bool draw) {
   if (!g_settings.bionicReading) {
     u8g2.setFont(MAIN_FONT);
-    u8g2.setCursor(x, yBaseline);
-    u8g2.print(text.c_str());
-    return;
+    if (draw) {
+      u8g2.setCursor(x, yBaseline);
+      u8g2.print(text.c_str());
+    }
+    return u8g2.getUTF8Width(text.c_str());
   }
 
   int cursorX = x;
@@ -1918,8 +2015,10 @@ static void drawReaderLineText(const String& text, int x, int yBaseline) {
 
     if (isSpace) {
       u8g2.setFont(MAIN_FONT);
-      u8g2.setCursor(cursorX, yBaseline);
-      u8g2.print(seg.c_str());
+      if (draw) {
+        u8g2.setCursor(cursorX, yBaseline);
+        u8g2.print(seg.c_str());
+      }
       cursorX += u8g2.getUTF8Width(seg.c_str());
       continue;
     }
@@ -1931,8 +2030,10 @@ static void drawReaderLineText(const String& text, int x, int yBaseline) {
 
     if (!isBionicWordLeadByte(lead) || strongBytes <= 0 || strongBytes >= (int)seg.length()) {
       u8g2.setFont(MAIN_FONT);
-      u8g2.setCursor(cursorX, yBaseline);
-      u8g2.print(seg.c_str());
+      if (draw) {
+        u8g2.setCursor(cursorX, yBaseline);
+        u8g2.print(seg.c_str());
+      }
       cursorX += u8g2.getUTF8Width(seg.c_str());
       continue;
     }
@@ -1941,16 +2042,33 @@ static void drawReaderLineText(const String& text, int x, int yBaseline) {
     String rest = seg.substring(strongBytes);
 
     u8g2.setFont(BOLD_FONT);
-    u8g2.setCursor(cursorX, yBaseline);
-    u8g2.print(strong.c_str());
+    if (draw) {
+      u8g2.setCursor(cursorX, yBaseline);
+      u8g2.print(strong.c_str());
+    }
     cursorX += u8g2.getUTF8Width(strong.c_str());
 
-    u8g2.setFont(MAIN_FONT);
-    u8g2.setCursor(cursorX, yBaseline);
-    u8g2.print(rest.c_str());
-    cursorX += u8g2.getUTF8Width(rest.c_str());
+    if (rest.length() > 0) {
+      cursorX += BIONIC_STRONG_REST_GAP_PX;
+      u8g2.setFont(MAIN_FONT);
+      if (draw) {
+        u8g2.setCursor(cursorX, yBaseline);
+        u8g2.print(rest.c_str());
+      }
+      cursorX += u8g2.getUTF8Width(rest.c_str());
+    }
   }
 
+  u8g2.setFont(MAIN_FONT);
+  return cursorX - x;
+}
+
+static int measureReaderLineTextWidth(const String& text) {
+  return layoutReaderLineText(text, 0, 0, false);
+}
+
+static void drawReaderLineText(const String& text, int x, int yBaseline) {
+  layoutReaderLineText(text, x, yBaseline, true);
   u8g2.setFont(MAIN_FONT);
 }
 
@@ -2006,7 +2124,7 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
         int clen = utf8SafeCharLenAt(t, i);
         if (clen <= 0) break;
         String candidate = chunk + t.substring(i, i + clen);
-        if (u8g2.getUTF8Width(candidate.c_str()) > m.maxWidth) break;
+        if (measureReaderLineTextWidth(candidate) > m.maxWidth) break;
         chunk = candidate;
         i += clen;
       }
@@ -2029,7 +2147,7 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
     if (line.length() == 0) {
       trimLeadingSpaces(t);
       if (t.length() == 0) return 0;
-      if (u8g2.getUTF8Width(t.c_str()) > m.maxWidth) {
+      if (measureReaderLineTextWidth(t) > m.maxWidth) {
         return hardBreakToken(t, tPos);
       }
       line = t;
@@ -2042,12 +2160,12 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
     if (t.length() == 0) return 0;
 
     String candidate = line + t;
-    if (u8g2.getUTF8Width(candidate.c_str()) > m.maxWidth) {
+    if (measureReaderLineTextWidth(candidate) > m.maxWidth) {
       trimTrailingSpaces(line);
       flushLine(line);
       if (linesUsed >= m.maxLines) return safeReturn(tPos);
 
-      if (u8g2.getUTF8Width(t.c_str()) > m.maxWidth) {
+      if (measureReaderLineTextWidth(t) > m.maxWidth) {
         return hardBreakToken(t, tPos);
       } else {
         line = t;
@@ -2604,69 +2722,104 @@ static void drawBookmarksList() {
 static String webUiStyle() {
   return String(
     "<style>"
-    ":root{--bg:#f3efe7;--card:#fff;--line:#ddd4c7;--line-soft:#ece5d9;--text:#1f2328;--muted:#667085;--link:#3c5a7a;--ok:#216e39;--okbg:#e7f6ec;--warn:#8a5a00;--warnbg:#fff4d6;--danger:#6e2a2a}"
+    ":root{"
+    "--bg:#f3efe7;--card:#fff;--line:#ddd4c7;--line-soft:#ece5d9;--text:#1f2328;--muted:#667085;--link:#3c5a7a;"
+    "--ok:#216e39;--okbg:#e7f6ec;--warn:#8a5a00;--warnbg:#fff4d6;--danger-bg:#b42318;--danger-fg:#fff;"
+    "--pill-bg:#f6f2ea;--pill-fg:#6b6358;--pre-bg:#fcfaf7;--stat-bg:#fcfaf7;--bar-bg:#ece5d9;--bar-bd:#e0d7ca;--bar-fill:#3c5a7a;"
+    "--ban-ok-bd:#cfe9d7;--ban-warn-bd:#ecd9a3;--btn-bg:#1f2328;--btn-fg:#fff;--btn-sec-bg:#eef2f6;--btn-sec-fg:#334e68;--btn-sec-bd:#d8e0e8;"
+    "--inp-bd:#c9c2b8;--inp-bg:#fff;--err:#b91c1c;--settings-row-bd:var(--line-soft)}"
+    "html[data-theme=dark]{"
+    "--bg:#14161c;--card:#1c2028;--line:#343a46;--line-soft:#262b34;--text:#e8eaef;--muted:#9aa3b2;--link:#8ab4f8;"
+    "--ok:#7dd89a;--okbg:#163526;--warn:#e6c84e;--warnbg:#3a3220;--danger-bg:#f56565;--danger-fg:#140505;"
+    "--pill-bg:#262b34;--pill-fg:#b4bcc8;--pre-bg:#12151c;--stat-bg:#12151c;--bar-bg:#262b34;--bar-bd:#343a46;--bar-fill:#8ab4f8;"
+    "--ban-ok-bd:#2d5a40;--ban-warn-bd:#5c4f24;--btn-bg:#e8eaef;--btn-fg:#14161c;--btn-sec-bg:#2a3140;--btn-sec-fg:#e8eaef;--btn-sec-bd:#3d4656;"
+    "--inp-bd:#454d5c;--inp-bg:#0f1218;--err:#f87171}"
     "*{box-sizing:border-box}"
     "body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,sans-serif}"
     ".wrap{max-width:820px;margin:0 auto;padding:18px}"
     ".wide{max-width:1020px}"
-    ".top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}"
+    ".top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px;flex-wrap:wrap}"
     ".top a,.link{color:var(--link);text-decoration:none}"
     ".top a:hover,.link:hover{text-decoration:underline}"
+    ".top-side{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;justify-content:flex-end;flex:1;min-width:0}"
     ".muted{color:var(--muted);font-size:13px}"
     ".card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 15px;margin:0 0 14px;box-shadow:0 1px 0 rgba(0,0,0,.03)}"
+    "html[data-theme=dark] .card{box-shadow:0 1px 0 rgba(255,255,255,.04)}"
     ".grid{display:grid;gap:12px}"
     ".actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}"
-    ".nav{display:flex;flex-wrap:wrap;gap:10px 14px;font-size:14px}"
+    ".nav{display:flex;flex-wrap:wrap;gap:10px 14px;font-size:14px;align-items:center}"
     ".nav a{color:var(--link);text-decoration:none}"
     ".list{list-style:none;padding:0;margin:0}"
     ".list li{padding:11px 0;border-top:1px solid var(--line-soft)}"
     ".list li:first-child{border-top:0;padding-top:0}"
     ".row{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}"
     ".meta{color:var(--muted);font-size:13px}"
-    ".pill{display:inline-block;background:#f6f2ea;color:#6b6358;border-radius:999px;padding:3px 8px;font-size:12px}"
-    ".pre{white-space:pre-wrap;line-height:1.45;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fcfaf7}"
-    ".danger{background:var(--danger)}"
-    ".banner-ok{background:var(--okbg);color:var(--ok);border:1px solid #cfe9d7;border-radius:12px;padding:12px 13px;margin-bottom:14px}"
-    ".banner-warn{background:var(--warnbg);color:var(--warn);border:1px solid #ecd9a3;border-radius:12px;padding:12px 13px;margin-bottom:14px}"
+    ".pill{display:inline-block;background:var(--pill-bg);color:var(--pill-fg);border-radius:999px;padding:3px 8px;font-size:12px}"
+    ".pre{white-space:pre-wrap;line-height:1.45;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--pre-bg)}"
+    ".danger{background:var(--danger-bg);color:var(--danger-fg)}"
+    ".banner-ok{background:var(--okbg);color:var(--ok);border:1px solid var(--ban-ok-bd);border-radius:12px;padding:12px 13px;margin-bottom:14px}"
+    ".banner-warn{background:var(--warnbg);color:var(--warn);border:1px solid var(--ban-warn-bd);border-radius:12px;padding:12px 13px;margin-bottom:14px}"
     ".stats{display:grid;gap:10px;grid-template-columns:repeat(2,minmax(0,1fr));margin-top:12px}"
-    ".stat{padding:11px 12px;border:1px solid var(--line-soft);border-radius:12px;background:#fcfaf7}"
+    ".stat{padding:11px 12px;border:1px solid var(--line-soft);border-radius:12px;background:var(--stat-bg)}"
     ".stat b{display:block;font-size:17px;line-height:1.2;margin-top:2px}"
-    ".bar{height:10px;border-radius:999px;background:#ece5d9;overflow:hidden;border:1px solid #e0d7ca;margin-top:12px}"
-    ".bar > span{display:block;height:100%;background:#3c5a7a}"
+    ".bar{height:10px;border-radius:999px;background:var(--bar-bg);overflow:hidden;border:1px solid var(--bar-bd);margin-top:12px}"
+    ".bar > span{display:block;height:100%;background:var(--bar-fill)}"
     ".stack{display:grid;gap:8px}"
     ".small{font-size:13px}"
-    "button,.btn{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:10px;background:#1f2328;color:#fff;padding:10px 14px;font:600 14px system-ui,sans-serif;text-decoration:none;cursor:pointer}"
-    ".btn.secondary{background:#eef2f6;color:#334e68;border:1px solid #d8e0e8}"
-    "input[type=text],input[type=file],select{width:100%;box-sizing:border-box;border:1px solid #c9c2b8;border-radius:10px;background:#fff;padding:10px;font:inherit}"
+    "button,.btn{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:10px;background:var(--btn-bg);color:var(--btn-fg);padding:10px 14px;font:600 14px system-ui,sans-serif;text-decoration:none;cursor:pointer}"
+    ".btn.secondary{background:var(--btn-sec-bg);color:var(--btn-sec-fg);border:1px solid var(--btn-sec-bd)}"
+    "input[type=text],input[type=file],select{width:100%;box-sizing:border-box;border:1px solid var(--inp-bd);border-radius:10px;background:var(--inp-bg);color:var(--text);padding:10px;font:inherit}"
+    "input[type=checkbox],input[type=radio]{accent-color:var(--link)}"
+    ".theme-toggle{padding:8px 12px;font-size:13px;white-space:nowrap}"
+    ".theme-toggle .tgd{display:none}"
+    "html[data-theme=dark] .theme-toggle .tgl{display:none}"
+    "html[data-theme=dark] .theme-toggle .tgd{display:inline !important}"
+    ".text-err{color:var(--err);font-weight:600}"
     "h1,h2,h3,p{margin:0}"
     "h1,h2,h3{margin-bottom:6px}"
     "p + p{margin-top:10px}"
     "@media(min-width:760px){.stats{grid-template-columns:repeat(4,minmax(0,1fr))}}"
-    "@media(max-width:640px){.row,.top{flex-direction:column}.wrap{padding:14px}}"
+    "@media(max-width:640px){.row,.top{flex-direction:column}.top-side{justify-content:flex-start}.wrap{padding:14px}}"
     "</style>"
+  );
+}
+
+static String webUiThemeScript() {
+  return String(
+    "<script>"
+    "(function(){"
+    "var k='palaTheme',r=document.documentElement;"
+    "function S(t){r.dataset.theme=(t==='dark')?'dark':'light';try{localStorage.setItem(k,(t==='dark')?'dark':'light')}catch(e){}}"
+    "function I(){var v=null;try{v=localStorage.getItem(k)}catch(e){}"
+    "if(v==='dark'||v==='light')S(v);"
+    "else S(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}"
+    "I();window.palaToggleTheme=function(){S(r.dataset.theme==='dark'?'light':'dark')};"
+    "})();"
+    "</script>"
   );
 }
 
 static String webPageStart(const String& title, const String& subtitle, const String& navHtml, bool wide = false) {
   String out;
-  out.reserve(1100);
-  out = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>";
+  out.reserve(2200);
+  out = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='color-scheme' content='light dark'><title>";
   out += title;
   out += "</title>";
   out += webUiStyle();
+  out += webUiThemeScript();
   out += "</head><body><div class='wrap";
   if (wide) out += " wide";
   out += "'><div class='top'><div><h1>";
   out += title;
   out += "</h1><div class='muted'>";
   out += subtitle;
-  out += "</div></div>";
+  out += "</div></div><div class='top-side'>";
   if (navHtml.length() > 0) {
     out += "<div class='nav'>";
     out += navHtml;
     out += "</div>";
   }
-  out += "</div>";
+  out += "<button type='button' class='btn secondary theme-toggle' onclick='palaToggleTheme()' title='Light or dark appearance'><span class='tgl'>Dark mode</span><span class='tgd' style='display:none'>Light mode</span></button></div></div>";
   return out;
 }
 
@@ -2841,8 +2994,8 @@ static void handleFiles() {
   out += "</div>";
 
   out += "<div class='card'><h2>Library files</h2>";
-  if (g_library.bookCount >= MAX_BOOKS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Library full (80 books max). Delete books to make room.</p>";
-  if (g_library.folderCount >= MAX_FOLDERS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Folder limit reached (32 max).</p>";
+  if (g_library.bookCount >= MAX_BOOKS) out += "<p class='text-err'>&#9888; Library full (80 books max). Delete books to make room.</p>";
+  if (g_library.folderCount >= MAX_FOLDERS) out += "<p class='text-err'>&#9888; Folder limit reached (32 max).</p>";
 
   if (g_library.bookCount == 0) {
     out += "<p class='muted'>No books uploaded yet.</p>";
@@ -3521,6 +3674,9 @@ static void handleSettings() {
   String lg3 = (g_settings.lineGap == 3) ? " selected" : "";
   String bionicChecked = g_settings.bionicReading ? " checked" : "";
 
+  String rfDefault = (g_settings.readingFont == 0) ? " selected" : "";
+  String rfOpenDys = (g_settings.readingFont == 1) ? " selected" : "";
+
   // Any /sleep.bin counts as "custom" for the web UI (legacy single-image mode).
   bool hasSleepImg = FS.exists("/sleep.bin");
   bool multiScreensaver = (prefs.getInt("cfg_ss_multi", 0) == 1);
@@ -3534,39 +3690,37 @@ static void handleSettings() {
   int nextSlot = firstFreeSleepSlot();
 
   String out;
-  out.reserve(6400);
-  out =
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Settings</title>"
-    "<style>"
-    "body{margin:0;background:#f3efe7;color:#1f2328;font:15px/1.45 system-ui,sans-serif}"
-    ".wrap{max-width:760px;margin:0 auto;padding:18px}"
-    ".top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}"
-    ".top a,.link{color:#3c5a7a;text-decoration:none}"
-    ".muted{color:#667085;font-size:13px}"
-    ".card{background:#fff;border:1px solid #ddd4c7;border-radius:14px;padding:14px 15px;margin:0 0 14px;box-shadow:0 1px 0 rgba(0,0,0,.03)}"
-    ".grid{display:grid;gap:12px}"
+  out.reserve(7200);
+  out = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='color-scheme' content='light dark'><title>Settings</title>";
+  out += webUiStyle();
+  out += "<style>"
+    ".wrap{max-width:760px}"
     "label{display:block;font-weight:600;margin:0 0 6px}"
-    "select,input[type=file]{width:100%;box-sizing:border-box;border:1px solid #c9c2b8;border-radius:10px;background:#fff;padding:10px;font:inherit}"
-    ".hint{margin:6px 0 0;color:#667085;font-size:12px}"
+    ".hint{margin:6px 0 0;color:var(--muted);font-size:12px}"
     ".actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}"
-    "button{border:0;border-radius:10px;background:#1f2328;color:#fff;padding:10px 14px;font:600 14px system-ui,sans-serif}"
     ".status{padding:10px 12px;border-radius:10px;font-size:14px;margin:10px 0 0}"
-    ".ok{background:#e7f6ec;color:#216e39}"
-    ".idle{background:#f6f2ea;color:#6b6358}"
+    ".ok{background:var(--okbg);color:var(--ok)}"
+    ".idle{background:var(--pill-bg);color:var(--pill-fg)}"
     "h1,h2{margin:0 0 6px}"
     "p{margin:0 0 10px}"
     "@media(min-width:620px){.grid.cols-2{grid-template-columns:1fr 1fr}}"
-    "</style></head><body><div class='wrap'>"
-    "<div class='top'><div><h1>Pala One Settings</h1><div class='muted'>Firmware " FW_VERSION " configuration page stored directly on the device.</div></div><a href='/'>&#8592; Home</a></div>"
-    "<div class='card'><h2>Reading</h2><form method='POST' action='/settings' accept-charset='UTF-8'><div class='grid cols-2'><div><label for='font'>Font size</label><select id='font' name='font'>"
-    "<option value='8'"; out += sel8; out += ">8px &mdash; tiny</option>";
+    "</style>";
+  out += webUiThemeScript();
+  out += "</head><body><div class='wrap'><div class='top'><div><h1>Pala One Settings</h1><div class='muted'>Firmware " FW_VERSION " configuration page stored directly on the device.</div></div><div class='top-side'><a class='btn secondary' href='/'>&#8592; Home</a><button type='button' class='btn secondary theme-toggle' onclick='palaToggleTheme()' title='Light or dark appearance'><span class='tgl'>Dark mode</span><span class='tgd' style='display:none'>Light mode</span></button></div></div>"
+    "<div class='card'><h2>Reading</h2><form method='POST' action='/settings' accept-charset='UTF-8'><div class='grid cols-2'><div><label for='font'>Font size</label><select id='font' name='font'>";
+  out += "<option value='8'"; out += sel8; out += ">8px &mdash; tiny</option>";
   out += "<option value='10'"; out += sel10; out += ">10px &mdash; small</option>";
   out += "<option value='12'"; out += sel12; out += ">12px &mdash; medium</option>";
   out += "<option value='14'"; out += sel14; out += ">14px &mdash; large</option>";
   out +=
-    "</select><div class='hint'>Controls how many lines fit on each page.</div></div>"
+    "</select><div class='hint'>Controls how many lines fit on each page.</div>"
+    "<label for='readfont' style='display:block;margin-top:12px'>Reading font</label><select id='readfont' name='readfont'>"
+    "<option value='0'";
+  out += rfDefault;
+  out += ">Default</option><option value='1'";
+  out += rfOpenDys;
+  out += ">OpenDyslexia</option></select>"
+    "<div class='hint'>OpenDyslexia uses wider Lucida Sans bitmaps built into firmware (screen font, not a separate file).</div></div>"
     "<div><label for='sleep'>Sleep after</label><select id='sleep' name='sleep'>"
     "<option value='30'"; out += ss30; out += ">30 seconds</option>";
   out += "<option value='60'"; out += ss60; out += ">1 minute</option>";
@@ -3614,15 +3768,15 @@ static void handleSettings() {
 
     for (int i = 0; i < slotCount; i++) {
       int slot = slotIds[i];
-      out += "<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid #eee'>";
+      out += "<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--line-soft)'>";
       out += "<img src='/sleep-thumb?slot=";
       out += String(slot);
       out += "' alt='slot ";
       out += String(slot);
-      out += "' style='width:180px;height:auto;border:1px solid #d7d0c3;border-radius:10px;background:#fff'>";
+      out += "' style='width:180px;height:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)'>";
       out += "<form method='POST' action='/sleep-slot-remove'><input type='hidden' name='slot' value='";
       out += String(slot);
-      out += "'><button type='submit' style='background:transparent;color:#6a7a8b;padding:0'>✕ Remove</button></form>";
+      out += "'><button type='submit' class='btn secondary' style='background:transparent;border:0;padding:0;color:var(--link)'>✕ Remove</button></form>";
       out += "</div>";
     }
 
@@ -3641,8 +3795,8 @@ static void handleSettings() {
       "<p>Images are raw XBM bytes: <b>3904 bytes</b>, 250&times;122 px, 1-bit, LSB-first, 32 bytes per row.</p>"
       "<p class='muted'>Tip: use <a class='link' href='https://javl.github.io/image2cpp/' target='_blank'>image2cpp</a> with <b>Plain bytes</b>. Invert colors if needed.</p>";
     if (hasSleepImg) {
-      out += "<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid #eee'>";
-      out += "<img src='/sleep-thumb?single=1' alt='single screensaver' style='width:180px;height:auto;border:1px solid #d7d0c3;border-radius:10px;background:#fff'>";
+      out += "<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--line-soft)'>";
+      out += "<img src='/sleep-thumb?single=1' alt='single screensaver' style='width:180px;height:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)'>";
       out += "<a class='link' href='/del-sleep' onclick=\"return confirm('Delete custom screensaver?')\">✕ Remove</a>";
       out += "</div>";
     } else {
@@ -3672,12 +3826,22 @@ static void handleSettingsPost() {
   bool layoutChanged = false;
   bool readerStyleChanged = false;
 
-  if (server.hasArg("font")) {
-    int fs = server.arg("font").toInt();
-    if (fs != 8 && fs != 10 && fs != 12 && fs != 14) fs = 10;
-    if (fs != g_settings.fontSize) {
-      applyFontSize(fs);
+  if (server.hasArg("font") || server.hasArg("readfont")) {
+    int fs = g_settings.fontSize;
+    if (server.hasArg("font")) {
+      fs = server.arg("font").toInt();
+      if (fs != 8 && fs != 10 && fs != 12 && fs != 14) fs = 10;
+    }
+    int rf = g_settings.readingFont;
+    if (server.hasArg("readfont")) {
+      rf = server.arg("readfont").toInt();
+      if (rf != 0 && rf != 1) rf = 0;
+    }
+    if (fs != g_settings.fontSize || rf != g_settings.readingFont) {
+      g_settings.readingFont = rf;
+      applyReaderFonts(fs);
       prefs.putInt("cfg_font", fs);
+      prefs.putInt("cfg_read_font", rf);
       layoutChanged = true;
     }
   }
@@ -3704,7 +3868,7 @@ static void handleSettingsPost() {
     }
   }
 
-  bool hasReadingSettingsArgs = server.hasArg("font") || server.hasArg("sleep") || server.hasArg("lgap") || server.hasArg("bionic");
+  bool hasReadingSettingsArgs = server.hasArg("font") || server.hasArg("readfont") || server.hasArg("sleep") || server.hasArg("lgap") || server.hasArg("bionic");
   if (hasReadingSettingsArgs) {
     bool bionicEnabled = server.hasArg("bionic");
     if (bionicEnabled != g_settings.bionicReading) {
@@ -3730,10 +3894,35 @@ static void handleSettingsPost() {
   }
 
   if (layoutChanged) {
-    // invalidateAllPageCaches() already resets pageIndex to 0 for the open book.
-    // Call it BEFORE renderCurrentPage() so the page is redrawn from byte 0
-    // with the new font metrics -- not from the now-invalid old page number.
-    invalidateAllPageCaches();
+    const uint32_t kReaderResumeUnset = 0xFFFFFFFFu;
+    uint32_t resumeFrom = kReaderResumeUnset;
+
+    // Settings are often changed while the device is in MODE_UPLOAD (web UI).
+    // Capture anchor position whenever a current book exists, regardless of mode.
+    if (g_reader.currentBookPath.length() > 0) {
+      if ((!g_reader.file || g_reader.file.isDirectory()) && !reopenCurrentBookIfNeeded()) {
+        // No readable handle; leave resumeFrom unset so behavior falls back safely.
+      } else if (g_reader.file && !g_reader.file.isDirectory()) {
+      size_t bookSize = g_reader.file.size();
+      if (bookSize > 0) {
+        int pi = g_reader.pageIndex;
+        if (pi < 0) pi = 0;
+        ensureOffsetsUpTo(pi);
+        if (g_reader.knownPages > 0 && pi >= g_reader.knownPages) {
+          pi = g_reader.knownPages - 1;
+        }
+        uint32_t top = g_reader.pageOffsets[pi];
+        if (top < bookSize) {
+          resumeFrom = findSentenceStartContaining(g_reader.file, bookSize, top);
+        }
+      }
+      }
+    }
+
+    invalidateAllPageCaches(resumeFrom);
+    if (g_reader.file && g_reader.currentBookPath.length() > 0) {
+      savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
+    }
     if (mode == MODE_READER || mode == MODE_BM_PREVIEW) {
       g_bookmarkUi.previewActive = false; // exit preview on layout change
       mode = MODE_READER;

@@ -32,8 +32,12 @@ The board version is usually printed on the back of the PCB.
 
 ## Fork Updates (Firmware 2.1.1)
 
-This fork includes an expanded screensaver system for the Heltec V1.2 firmware:
+This fork includes multiple firmware and WebUI improvements for the Heltec V1.2 build:
 
+- Bionic Reading toggle in settings (bold word starts for faster scanning)
+- Reading font dropdown with `Default` and `OpenDyslexia` options
+- Dark mode toggle in WebUI
+- Reading-location retention on layout changes so font/font-size/line-spacing updates keep the user near the same sentence instead of jumping to page 1
 - Single and multi screensaver modes in the WebUI Settings page
 - Mode-specific UI (single mode and multi mode are shown separately)
 - Multi-screensaver rotation list with per-image thumbnail previews
