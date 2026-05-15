@@ -53,7 +53,9 @@ make
 
 ### App API
 
-Apps communicate with the firmware through the `PalaAPI` function pointer table passed to `app_main`. Available functions (v1):
+Apps communicate with the firmware through the `PalaAPI` function pointer table passed to `app_main`. The current API version is **v3** (`PALA_API_VERSION 3` in `pala_app.h`).
+
+#### Display
 
 | Function | Description |
 |---|---|
@@ -62,15 +64,44 @@ Apps communicate with the firmware through the `PalaAPI` function pointer table 
 | `drawTextAt(x, y, text, bold)` | Draw text at a pixel position |
 | `drawCenteredLarge(text)` | Draw text centred on screen in a large font |
 | `refreshDisplay()` | Push the frame buffer to the e-ink panel |
+
+#### Input
+
+| Function | Description |
+|---|---|
 | `waitForEvent()` | Block until a button gesture; returns `PALA_CLICK` / `PALA_DOUBLE` / `PALA_TRIPLE` / `PALA_LONG` |
+| `pollEvent()` | Non-blocking variant; returns 0 if no event is ready |
+| `buttonPressed()` | Returns 1 if the button is currently held, 0 otherwise |
+| `pendingPresses()` | Count of individual short press-release events since last call; bypasses multi-click grouping |
+
+#### Timing
+
+| Function | Description |
+|---|---|
+| `millisNow()` | Current uptime in milliseconds |
+| `delayMs(ms)` | Yield for `ms` milliseconds |
+| `rtcSeconds()` | Monotonic seconds counter that survives deep sleep; use for cross-session timing |
+
+#### Storage
+
+| Function | Description |
+|---|---|
+| `storageRead(key, buf, maxlen)` | Read from `/apps/{key}.dat`; returns bytes read, -1 on error |
+| `storageWrite(key, buf, len)` | Write to `/apps/{key}.dat`; returns bytes written, -1 on error |
+
+#### Utilities
+
+| Function | Description |
+|---|---|
 | `snprintf_wrap(buf, len, fmt, ...)` | Standard `snprintf` |
 
 Return from `app_main` to exit back to the Apps menu. Apps decide their own exit gesture — the firmware does not impose one.
 
-**Constraints (v1):**
+**Constraints:**
 - Apps must be compiled `-fPIC -mlongcalls` (position-independent).
 - Apps must not use static mutable variables — the loader does not patch `.data` relocations.
 - Maximum binary size: 48 KB.
+- The `api_version` field in `PalaAppHeader` must match `PALA_API_VERSION` exactly — the firmware rejects mismatched binaries.
 
 ## Features
 
