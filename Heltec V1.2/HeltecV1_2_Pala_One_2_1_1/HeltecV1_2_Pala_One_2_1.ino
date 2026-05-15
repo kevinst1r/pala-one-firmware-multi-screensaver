@@ -12,6 +12,7 @@ EInkDisplay_WirelessPaperV1_2 display;
 
 #include <Adafruit_GFX.h>
 #include <U8g2_for_Adafruit_GFX.h>
+#include "opendyslexic_u8g2_fonts.h"
 U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 #include <esp_timer.h>
@@ -125,7 +126,7 @@ struct LayoutMetrics {
 
 struct RuntimeSettings {
   int fontSize = 8;
-  // 0 = Helvetica (default), 1 = OpenDyslexia-style (Lucida Sans Unicode bitmaps in u8g2).
+  // 0 = Helvetica (default), 1 = OpenDyslexic (embedded u8g2 bitmap font set).
   int readingFont = 0;
   uint32_t sleepSecs = 120;
   int lineGap = 0;
@@ -427,11 +428,11 @@ static void applyReaderFonts(int sz) {
 
   if (g_settings.readingFont == 1) {
     switch (sz) {
-      case 8:  MAIN_FONT = u8g2_font_luRS08_te; BOLD_FONT = u8g2_font_luBS08_te; break;
-      case 10: MAIN_FONT = u8g2_font_luRS10_te; BOLD_FONT = u8g2_font_luBS10_te; break;
-      case 12: MAIN_FONT = u8g2_font_luRS12_te; BOLD_FONT = u8g2_font_luBS12_te; break;
-      case 14: MAIN_FONT = u8g2_font_luRS14_te; BOLD_FONT = u8g2_font_luBS14_te; break;
-      default: MAIN_FONT = u8g2_font_luRS10_te; BOLD_FONT = u8g2_font_luBS10_te; break;
+      case 8:  MAIN_FONT = u8g2_font_open_dys_r08_te; BOLD_FONT = u8g2_font_open_dys_b08_te; break;
+      case 10: MAIN_FONT = u8g2_font_open_dys_r10_te; BOLD_FONT = u8g2_font_open_dys_b10_te; break;
+      case 12: MAIN_FONT = u8g2_font_open_dys_r12_te; BOLD_FONT = u8g2_font_open_dys_b12_te; break;
+      case 14: MAIN_FONT = u8g2_font_open_dys_r14_te; BOLD_FONT = u8g2_font_open_dys_b14_te; break;
+      default: MAIN_FONT = u8g2_font_open_dys_r10_te; BOLD_FONT = u8g2_font_open_dys_b10_te; break;
     }
   } else {
     switch (sz) {
@@ -3655,6 +3656,281 @@ static uint8_t reverseBits8(uint8_t b) {
   return b;
 }
 
+static String screensaverEditorHtml(bool multiScreensaver, bool hasFreeSlot) {
+  String out;
+  out.reserve(11800);
+  out +=
+    "<style>"
+    ".ss-wrap{display:grid;gap:12px}"
+    ".ss-card{border:1px solid var(--line-soft);border-radius:12px;padding:10px 11px;background:var(--stat-bg)}"
+    ".ss-grid{display:grid;gap:10px;grid-template-columns:repeat(2,minmax(0,1fr))}"
+    ".ss-grid .full{grid-column:1/-1}"
+    ".ss-grid > div{min-width:0}"
+    ".ss-adv{border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--card)}"
+    ".ss-adv summary{cursor:pointer;font-weight:600;list-style:none}"
+    ".ss-adv summary::-webkit-details-marker{display:none}"
+    ".ss-adv summary:after{content:'▾';float:right;color:var(--muted)}"
+    ".ss-adv[open] summary:after{content:'▴'}"
+    ".ss-adv-body{margin-top:10px}"
+    ".ss-label-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 0 6px}"
+    ".ss-value{font-size:12px;color:var(--muted);white-space:nowrap}"
+    ".ss-preview-wrap{display:grid;gap:8px}"
+    ".ss-meta{font-size:12px;color:var(--muted)}"
+    ".ss-tip{font-size:12px;color:var(--muted)}"
+    ".ss-status{font-size:13px;color:var(--muted)}"
+    ".ss-wrap input[type=range]{display:block;width:100%;max-width:420px}"
+    "@media(max-width:560px){.ss-grid{grid-template-columns:1fr}}"
+    "</style>";
+
+  out +=
+    "<div class='card'><h2>Screensaver editor</h2>"
+    "<p class='muted'>Edit on phone in browser and upload directly. Supports drag + pinch zoom. "
+    "Output is always 250&times;122, 1-bit, 3904 bytes.</p>"
+    "<div class='ss-wrap'>"
+    "<div class='ss-card ss-grid'>"
+    "<div class='full'><div class='ss-label-row'><label for='ssEditFile'>Source image</label></div><input id='ssEditFile' type='file' accept='image/*'></div>"
+    "<div><div class='ss-label-row'><label for='ssTolerance'>Black tolerance</label><span class='ss-value' id='ssToleranceLabel'>0%</span></div><input id='ssTolerance' type='range' min='-100' max='100' value='0'></div>"
+    "<div class='full'><label style='display:flex;gap:10px;align-items:center;font-weight:500'><input id='ssInvert' type='checkbox'><span>Invert black/white</span></label></div>"
+    "<div class='full'><details class='ss-adv'><summary>Precise Control</summary><div class='ss-adv-body ss-grid'>"
+    "<div><div class='ss-label-row'><label for='ssZoom'>Zoom</label><span class='ss-value' id='ssZoomLabel'>100%</span></div><input id='ssZoom' type='range' min='10' max='400' value='100'></div>"
+    "<div><div class='ss-label-row'><label for='ssPanX'>Move X</label><span class='ss-value' id='ssPanXLabel'>0 px</span></div><input id='ssPanX' type='range' min='-250' max='250' value='0'></div>"
+    "<div><div class='ss-label-row'><label for='ssPanY'>Move Y</label><span class='ss-value' id='ssPanYLabel'>0 px</span></div><input id='ssPanY' type='range' min='-180' max='180' value='0'></div>"
+    "</div></details></div>"
+    "</div>"
+    "<div class='ss-card ss-preview-wrap'>"
+    "<label>Preview (drag to move, pinch to zoom)</label>"
+    "<canvas id='ssPreview' width='250' height='122' style='width:100%;max-width:520px;border:1px solid var(--line);border-radius:10px;background:#fff;image-rendering:pixelated;touch-action:none'></canvas>"
+    "<div class='ss-meta' id='ssMeta'>No image loaded</div>"
+    "</div>";
+
+  if (multiScreensaver) {
+    out +=
+      "<div class='ss-card ss-grid'>"
+      "<div><div class='ss-label-row'><label for='ssDestination'>Destination</label></div><select id='ssDestination'>"
+      "<option value='slot' selected>Add to rotation slot (next free)</option>"
+      "<option value='single'>Single screensaver (/sleep.bin)</option>"
+      "</select></div>"
+      "<div><div class='ss-label-row'><label>Rotation</label></div><div class='ss-tip'>";
+    if (hasFreeSlot) out += "Upload adds to the next free slot automatically.";
+    else out += "All 8 slots are full. Remove one from Screensaver files before adding.";
+    out += "</div></div></div>";
+  }
+
+  out +=
+    "<div class='actions'>"
+    "<button type='button' id='ssResetBtn'>Reset fit</button>"
+    "<button type='button' class='btn secondary' id='ssUploadBtn'>Upload edited image</button>"
+    "<span class='ss-status' id='ssUploadStatus'></span>"
+    "</div></div></div>";
+
+  out += "<script>"
+    "(function(){"
+    "if(window.__palaSleepEditorInit)return;"
+    "window.__palaSleepEditorInit=1;"
+    "var W=250,H=122,ROW=32,TOTAL=H*ROW;"
+    "var fileInput=document.getElementById('ssEditFile');"
+    "var tol=document.getElementById('ssTolerance');"
+    "var tolLbl=document.getElementById('ssToleranceLabel');"
+    "var zoom=document.getElementById('ssZoom');"
+    "var zoomLbl=document.getElementById('ssZoomLabel');"
+    "var panX=document.getElementById('ssPanX');"
+    "var panY=document.getElementById('ssPanY');"
+    "var panXLbl=document.getElementById('ssPanXLabel');"
+    "var panYLbl=document.getElementById('ssPanYLabel');"
+    "var inv=document.getElementById('ssInvert');"
+    "var canvas=document.getElementById('ssPreview');"
+    "var meta=document.getElementById('ssMeta');"
+    "var status=document.getElementById('ssUploadStatus');"
+    "var resetBtn=document.getElementById('ssResetBtn');"
+    "var uploadBtn=document.getElementById('ssUploadBtn');"
+    "var dstSel=document.getElementById('ssDestination');"
+    "var hasFreeSlot=";
+  out += hasFreeSlot ? "true" : "false";
+  out +=
+    ";"
+    "if(!fileInput||!tol||!zoom||!panX||!panY||!inv||!canvas||!meta||!status||!resetBtn||!uploadBtn)return;"
+    "var ctx=canvas.getContext('2d',{willReadFrequently:true});"
+    "var work=document.createElement('canvas');work.width=W;work.height=H;"
+    "var workCtx=work.getContext('2d',{willReadFrequently:true});"
+    "var sourceImage=null;"
+    "var isDragging=false;"
+    "var dragStartX=0,dragStartY=0,dragPanX=0,dragPanY=0;"
+    "var pointers={};"
+    "var pinch={active:false,startDist:0,startZoom:100,startPanX:0,startPanY:0,startMidX:0,startMidY:0};"
+    "function clamp(v,min,max){return v<min?min:(v>max?max:v)}"
+    "function thresholdFromTolerance(offset){"
+      "var o=clamp(parseInt(offset||0,10)||0,-100,100);"
+      "var delta=Math.round(o*(255-128)/100);"
+      "return clamp(128+delta,0,255);"
+    "}"
+    "function setPanLabels(){panXLbl.textContent=panX.value+' px';panYLbl.textContent=panY.value+' px';}"
+    "function setControlLabels(){"
+      "var tv=parseInt(tol.value,10)||0;"
+      "tolLbl.textContent=(tv>0?'+':'')+tv+'%';"
+      "zoomLbl.textContent=zoom.value+'%';"
+      "setPanLabels();"
+    "}"
+    "function fitImage(){"
+      "if(!sourceImage)return;"
+      "zoom.value='100';panX.value='0';panY.value='0';setControlLabels();render();"
+    "}"
+    "function drawSourceToWork(){"
+      "workCtx.fillStyle='#fff';workCtx.fillRect(0,0,W,H);"
+      "if(!sourceImage)return;"
+      "var base=Math.min(W/sourceImage.width,H/sourceImage.height);"
+      "var scale=base*((parseInt(zoom.value,10)||100)/100);"
+      "if(!isFinite(scale)||scale<=0)scale=base;"
+      "var dw=Math.max(1,Math.round(sourceImage.width*scale));"
+      "var dh=Math.max(1,Math.round(sourceImage.height*scale));"
+      "var x=((W-dw)/2)+(parseInt(panX.value,10)||0);"
+      "var y=((H-dh)/2)+(parseInt(panY.value,10)||0);"
+      "workCtx.drawImage(sourceImage,x,y,dw,dh);"
+    "}"
+    "function toOneBit(){"
+      "var img=workCtx.getImageData(0,0,W,H);"
+      "var d=img.data;"
+      "var threshold=thresholdFromTolerance(tol.value);"
+      "var invert=!!inv.checked;"
+      "for(var i=0;i<d.length;i+=4){"
+        "var lum=((d[i]*299)+(d[i+1]*587)+(d[i+2]*114))/1000;"
+        "var white=(lum>=threshold);"
+        "if(invert)white=!white;"
+        "var c=white?255:0;"
+        "d[i]=c;d[i+1]=c;d[i+2]=c;d[i+3]=255;"
+      "}"
+      "ctx.putImageData(img,0,0);"
+      "return img;"
+    "}"
+    "function packBytes(img){"
+      "var d=img.data;"
+      "var out=new Uint8Array(TOTAL);"
+      "for(var y=0;y<H;y++){"
+        "for(var x=0;x<W;x++){"
+          "var i=(y*W+x)*4;"
+          "if(d[i]>=128){"
+            "var bi=(y*ROW)+(x>>3);"
+            "out[bi]=out[bi]|(1<<(x&7));"
+          "}"
+        "}"
+      "}"
+      "return out;"
+    "}"
+    "function render(){"
+      "setControlLabels();"
+      "drawSourceToWork();"
+      "var oneBit=toOneBit();"
+      "if(!sourceImage){meta.textContent='No image loaded';return null;}"
+      "var threshold=thresholdFromTolerance(tol.value);"
+      "meta.textContent='Preview: '+W+'x'+H+'  threshold '+threshold+'  bytes '+TOTAL;"
+      "return oneBit;"
+    "}"
+    "function pointerList(){var a=[];for(var k in pointers){a.push(pointers[k]);}return a;}"
+    "function dist(a,b){var dx=a.x-b.x,dy=a.y-b.y;return Math.sqrt(dx*dx+dy*dy);}"
+    "function mid(a,b){return{x:(a.x+b.x)/2,y:(a.y+b.y)/2};}"
+    "function beginPinchIfNeeded(){"
+      "var pts=pointerList();"
+      "if(pts.length===2){"
+        "pinch.active=true;"
+        "pinch.startDist=Math.max(8,dist(pts[0],pts[1]));"
+        "pinch.startZoom=parseInt(zoom.value,10)||100;"
+        "pinch.startPanX=parseInt(panX.value,10)||0;"
+        "pinch.startPanY=parseInt(panY.value,10)||0;"
+        "var m=mid(pts[0],pts[1]);"
+        "pinch.startMidX=m.x;pinch.startMidY=m.y;"
+      "} else {"
+        "pinch.active=false;"
+      "}"
+    "}"
+    "fileInput.addEventListener('change',function(){"
+      "var f=fileInput.files&&fileInput.files[0];"
+      "if(!f){sourceImage=null;render();return;}"
+      "status.textContent='';"
+      "var r=new FileReader();"
+      "r.onload=function(){"
+        "var im=new Image();"
+        "im.onload=function(){sourceImage=im;fitImage();};"
+        "im.onerror=function(){status.textContent='Could not decode image.';};"
+        "im.src=r.result;"
+      "};"
+      "r.onerror=function(){status.textContent='Could not read image.';};"
+      "r.readAsDataURL(f);"
+    "});"
+    "[tol,zoom,panX,panY,inv].forEach(function(el){el.addEventListener('input',render);el.addEventListener('change',render);});"
+    "resetBtn.addEventListener('click',function(){fitImage();status.textContent='';});"
+    "canvas.addEventListener('pointerdown',function(e){"
+      "pointers[e.pointerId]={x:e.clientX,y:e.clientY};"
+      "canvas.setPointerCapture(e.pointerId);"
+      "var pts=pointerList();"
+      "if(pts.length===1){"
+        "isDragging=true;dragStartX=e.clientX;dragStartY=e.clientY;dragPanX=parseInt(panX.value,10)||0;dragPanY=parseInt(panY.value,10)||0;"
+      "}"
+      "beginPinchIfNeeded();"
+    "});"
+    "canvas.addEventListener('pointermove',function(e){"
+      "if(!pointers[e.pointerId])return;"
+      "pointers[e.pointerId].x=e.clientX;"
+      "pointers[e.pointerId].y=e.clientY;"
+      "var pts=pointerList();"
+      "if(pinch.active&&pts.length===2){"
+        "var d=Math.max(8,dist(pts[0],pts[1]));"
+        "var ratio=d/pinch.startDist;"
+        "var newZoom=Math.round(pinch.startZoom*ratio);"
+        "zoom.value=String(clamp(newZoom,10,400));"
+        "var m=mid(pts[0],pts[1]);"
+        "panX.value=String(clamp(pinch.startPanX+Math.round(m.x-pinch.startMidX),-250,250));"
+        "panY.value=String(clamp(pinch.startPanY+Math.round(m.y-pinch.startMidY),-180,180));"
+        "render();"
+        "return;"
+      "}"
+      "if(isDragging&&pts.length===1){"
+        "panX.value=String(clamp(dragPanX+Math.round(e.clientX-dragStartX),-250,250));"
+        "panY.value=String(clamp(dragPanY+Math.round(e.clientY-dragStartY),-180,180));"
+        "render();"
+      "}"
+    "});"
+    "function endPointer(e){"
+      "delete pointers[e.pointerId];"
+      "var pts=pointerList();"
+      "if(pts.length===1){"
+        "isDragging=true;"
+        "dragStartX=pts[0].x;dragStartY=pts[0].y;"
+        "dragPanX=parseInt(panX.value,10)||0;dragPanY=parseInt(panY.value,10)||0;"
+      "} else {"
+        "isDragging=false;"
+      "}"
+      "beginPinchIfNeeded();"
+    "}"
+    "canvas.addEventListener('pointerup',endPointer);"
+    "canvas.addEventListener('pointercancel',endPointer);"
+    "uploadBtn.addEventListener('click',function(){"
+      "if(!sourceImage){status.textContent='Choose an image first.';return;}"
+      "var img=render();"
+      "if(!img){status.textContent='Preview is not ready yet.';return;}"
+      "var bytes=packBytes(img);"
+      "var fd=new FormData();"
+      "fd.append('file',new Blob([bytes],{type:'application/octet-stream'}),'sleep-editor.bin');"
+      "var endpoint='/upload-sleep';"
+      "if(dstSel&&dstSel.value==='slot'){"
+        "if(!hasFreeSlot){status.textContent='All 8 rotation slots are full. Remove one first.';return;}"
+        "endpoint='/upload-sleep-slot';"
+      "}"
+      "status.textContent='Uploading...';"
+      "uploadBtn.disabled=true;"
+      "fetch(endpoint,{method:'POST',body:fd}).then(function(res){"
+        "if(!res.ok){return res.text().then(function(t){throw new Error(t||('HTTP '+res.status));});}"
+        "status.textContent='Upload complete. Refreshing...';"
+        "setTimeout(function(){window.location.href='/settings';},600);"
+      "}).catch(function(err){"
+        "status.textContent='Upload failed: '+(err&&err.message?err.message:'error');"
+      "}).finally(function(){uploadBtn.disabled=false;});"
+    "});"
+    "setControlLabels();"
+    "render();"
+    "})();"
+    "</script>";
+  return out;
+}
+
 static void handleSettings() {
   String sel8 = (g_settings.fontSize == 8) ? " selected" : "";
   String sel10 = (g_settings.fontSize == 10) ? " selected" : "";
@@ -3690,7 +3966,7 @@ static void handleSettings() {
   int nextSlot = firstFreeSleepSlot();
 
   String out;
-  out.reserve(7200);
+  out.reserve(15000);
   out = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='color-scheme' content='light dark'><title>Settings</title>";
   out += webUiStyle();
   out += "<style>"
@@ -3720,7 +3996,7 @@ static void handleSettings() {
   out += ">Default</option><option value='1'";
   out += rfOpenDys;
   out += ">OpenDyslexia</option></select>"
-    "<div class='hint'>OpenDyslexia uses wider Lucida Sans bitmaps built into firmware (screen font, not a separate file).</div></div>"
+    "<div class='hint'>OpenDyslexia uses embedded OpenDyslexic bitmap glyphs built into firmware.</div></div>"
     "<div><label for='sleep'>Sleep after</label><select id='sleep' name='sleep'>"
     "<option value='30'"; out += ss30; out += ">30 seconds</option>";
   out += "<option value='60'"; out += ss60; out += ">1 minute</option>";
@@ -3814,6 +4090,8 @@ static void handleSettings() {
       "<div class='actions'><button type='submit'>Use multiple screensavers</button></div>"
       "</form></div>";
   }
+
+  out += screensaverEditorHtml(multiScreensaver, nextSlot >= 0);
 
   out += "</div></body></html>";
 

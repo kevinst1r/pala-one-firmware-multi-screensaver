@@ -35,7 +35,7 @@ The board version is usually printed on the back of the PCB.
 This fork includes multiple firmware and WebUI improvements for the Heltec V1.2 build:
 
 - Bionic Reading toggle in settings (bold word starts for faster scanning)
-- Reading font dropdown with `Default` and `OpenDyslexia` options
+- Reading font dropdown with `Default` and `OpenDyslexia` options (see below)
 - Dark mode toggle in WebUI
 - Reading-location retention on layout changes so font/font-size/line-spacing updates keep the user near the same sentence instead of jumping to page 1
 - Single and multi screensaver modes in the WebUI Settings page
@@ -46,6 +46,14 @@ This fork includes multiple firmware and WebUI improvements for the Heltec V1.2 
 - Shuffle avoids immediate back-to-back repeats
 - Single custom screensaver also shows a thumbnail with inline remove action
 - Screensaver thumbnails are generated on-device using the same bitmap pipeline as displayed images
+- Built-in WebUI screensaver editor (phone/browser-side processing, no on-device image conversion)
+
+### OpenDyslexia reading font
+
+The `OpenDyslexia` setting uses **embedded [OpenDyslexic](https://github.com/antijingoist/open-dyslexic)** Regular and Bold outlines (SIL Open Font License), rasterized into **u8g2** bitmap fonts in firmware (`opendyslexic_u8g2_fonts.h`). It is not a separate file on disk and does not use the old Lucida Sans stand-in.
+
+- **Glyph coverage:** printable ASCII only (`0x20`–`0x7E`). Other Unicode characters are not drawn with this face.
+- **Size presets:** the 8 / 10 / 12 / 14 pt labels match the same **pixel heights** as the stock u8g2 Helvetica reader fonts (rasterized at **11 / 14 / 17 / 20 px** respectively), so line count and visual scale stay comparable to `Default`.
 
 ### Multi-screensaver behavior
 
@@ -53,6 +61,17 @@ This fork includes multiple firmware and WebUI improvements for the Heltec V1.2 
 - Each rotation image must be raw XBM bytes, exactly `3904` bytes (`250x122`, 1-bit, LSB-first)
 - Single mode uses `/sleep.bin`
 - If multi mode is enabled and rotation slots exist, the single custom image is ignored until single mode is re-enabled
+
+### WebUI screensaver editor
+
+The Settings page now includes a built-in editor for creating and uploading valid sleep images directly from phone or desktop browser.
+
+- Live preview rendered as exact device output (`250x122`, 1-bit)
+- Controls: black tolerance and invert are always visible
+- `Precise Control` section (collapsed by default): zoom + move X/Y
+- Touch gestures on preview: drag to pan and pinch to zoom
+- In multi mode, default destination is **Add to rotation slot (next free)** (no manual slot selection)
+- If all 8 rotation slots are full, upload is blocked with a clear UI message
 
 ## Hardware
 
