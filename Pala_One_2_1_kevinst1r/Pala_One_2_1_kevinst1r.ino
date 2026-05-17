@@ -1,5 +1,26 @@
 #include <heltec-eink-modules.h>
-EInkDisplay_WirelessPaperV1_2 display;
+
+#include "pala_app.h"
+#include "pala_api.h"
+#include <stdarg.h>
+
+// ── Board selection: uncomment the line that matches your hardware ────────────
+// #define BOARD_V1_1
+// #define BOARD_V1_2
+// ─────────────────────────────────────────────────────────────────────────────
+#ifdef BOARD_V1_1
+  using DisplayType = EInkDisplay_WirelessPaperV1_1;
+  #define BOARD_CHOSEN 
+#endif
+#if defined BOARD_V1_2
+  using DisplayType = EInkDisplay_WirelessPaperV1_2;
+  #define BOARD_CHOSEN 
+#endif
+#ifndef BOARD_CHOSEN
+  #error "Uncomment a board version"
+#endif
+
+DisplayType display;
 
 #include "pala_one_sleep_black_icon_v4.h"
 
@@ -16,14 +37,17 @@ EInkDisplay_WirelessPaperV1_2 display;
 U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 #include <esp_timer.h>
+#include <esp_rtc_time.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include <esp_sleep.h>
+#include <esp_heap_caps.h>
+#include <soc/soc.h>
 
 // ============================================================================
 //  Firmware / Product constants
 // ============================================================================
-#define FW_VERSION "2.1.1"
+#define FW_VERSION "2.1"
 
 static const int SCREEN_W = 250;
 static const int SCREEN_H = 122;
@@ -92,7 +116,8 @@ enum Mode {
   MODE_LIST,
   MODE_BM_BOOK_SELECT,
   MODE_BM_LIST,
-  MODE_BM_PREVIEW
+  MODE_BM_PREVIEW,
+  MODE_APPS,
 };
 
 enum ReaderLongPressAction {
@@ -106,7 +131,8 @@ enum LibraryEntryType {
   LIB_ENTRY_BOOKMARKS,
   LIB_ENTRY_LIST,
   LIB_ENTRY_ABOUT,
-  LIB_ENTRY_UPLOAD
+  LIB_ENTRY_UPLOAD,
+  LIB_ENTRY_APPS,
 };
 
 struct BookInfo {
@@ -196,21 +222,46 @@ struct ListState {
   int selectedIndex = 0;
 };
 
+#define MAX_APPS     16
+#define MAX_APP_NAME 32
+#define MAX_APP_PATH 80
+
+struct AppDiscovery {
+  char name[MAX_APP_NAME + 1];
+  char path[MAX_APP_PATH + 1];
+};
+
+struct AppsState {
+  AppDiscovery apps[MAX_APPS];
+  int count         = 0;
+  int selectedIndex = 0;
+};
+
 struct UploadState {
   File bookTmpFile;
   File sleepTmpFile;
+  File appTmpFile;
 
   String bookTmpPath;
   String bookPendingUtf8Tail;
   String bookFinalName;
   bool bookOk = false;
   String bookError;
+  // Cross-chunk state for streaming compactText() during upload, so
+  // whitespace runs that span chunk boundaries don't produce duplicates.
+  bool bookCompactLastWasSpace = false;
+  int  bookCompactNewlineCount = 0;
 
   String sleepTmpPath;
   bool sleepOk = false;
   String sleepError;
   int sleepSlotTarget = -1;
   bool sleepSlotUpload = false;
+
+  String appTmpPath;
+  String appFinalName;
+  bool appOk = false;
+  String appError;
 
   uint32_t startedMs = 0;
 };
@@ -241,6 +292,8 @@ struct ButtonState {
   bool quadClick = false;
   bool longClick = false;
 
+  uint32_t rawPressCount = 0; // every short press-release, unfiltered by multi-click windows
+
   void resetClicks() {
     shortClick = false;
     doubleClick = false;
@@ -257,6 +310,7 @@ struct ButtonState {
     lastRelease = 0;
     firstClickRelease = 0;
     clickCount = 0;
+    rawPressCount = 0;
     resetClicks();
   }
 
@@ -295,6 +349,10 @@ uint32_t g_offsetCacheStamp = 1;
 
 uint32_t lastUserActionMs = 0;
 int menuDrawsSinceFull = 0;
+static AppsState g_apps;
+static PalaAPI   g_palaAPI;
+static void*     g_appExecBuf  = nullptr;
+static size_t    g_appExecSize = 0;
 LayoutMetrics g_metrics;
 bool g_metricsValid = false;
 
@@ -314,7 +372,7 @@ volatile uint32_t g_isrDropCount = 0;
 // ============================================================================
 class HeltecGFXAdapter : public Adafruit_GFX {
 public:
-  explicit HeltecGFXAdapter(EInkDisplay_WirelessPaperV1_2& d)
+  explicit HeltecGFXAdapter(DisplayType& d)
     : Adafruit_GFX(SCREEN_W, SCREEN_H), disp(d) {}
 
   void drawPixel(int16_t x, int16_t y, uint16_t color) override {
@@ -326,7 +384,7 @@ public:
   }
 
 private:
-  EInkDisplay_WirelessPaperV1_2& disp;
+  DisplayType& disp;
 };
 HeltecGFXAdapter gfx(display);
 
@@ -360,7 +418,8 @@ static void idlePrefetchReader();
 static String pageCachePathForBook(const String& path);
 static bool loadPageOffsetCacheForBook(const String& path, size_t expectedSize);
 static void savePageOffsetCacheForBook(const String& path, size_t fileSize);
-static void invalidateAllPageCaches(uint32_t resumeFromByte);
+static void invalidateAllPageCaches();
+static void relocateOpenBookToOffset(uint32_t targetOffset);
 static uint32_t resolveBookmarkOffset(const String& path, uint16_t page, uint32_t storedOffset);
 static String readPageTextForWeb(const String& path, int page);
 
@@ -486,8 +545,10 @@ static void clearButtonQueue() {
 void IRAM_ATTR btnISR() {
   uint8_t next = (uint8_t)((btnQHead + 1) % BTN_Q);
   if (next == btnQTail) {
-    btnQTail = (uint8_t)((btnQTail + 1) % BTN_Q);
+    // Queue full: drop the NEW event. Advancing btnQTail from the ISR would
+    // race ButtonState::poll() and deliver events out of order.
     g_isrDropCount++;
+    return;
   }
   btnQState[btnQHead] = (digitalRead(BTN) == LOW);
   btnQTimeMs[btnQHead] = isrNowMs();
@@ -528,6 +589,7 @@ void ButtonState::poll() {
           clickCount = 0;
           longClick = true;
         } else {
+          rawPressCount++;  // count every short press unconditionally
           clickCount++;
           lastRelease = edgeT;
           if (clickCount == 1) firstClickRelease = edgeT;
@@ -549,7 +611,7 @@ void ButtonState::poll() {
     else if (clickCount == 3) emit = (uint32_t)(now - firstClickRelease) > TRIPLE_MS;
 
     if (emit) {
-      if (clickCount == 1) shortClick = true;
+      if (clickCount == 1) shortClick  = true;
       else if (clickCount == 2) doubleClick = true;
       else if (clickCount == 3) tripleClick = true;
       clickCount = 0;
@@ -914,7 +976,7 @@ static bool loadPageOffsetCacheForBook(const String& path, size_t expectedSize) 
 }
 
 static void savePageOffsetCacheForBook(const String& path, size_t fileSize) {
-  if (g_reader.knownPages < 1) return;
+  if (g_reader.knownPages <= 1) return;
 
   String cachePath = pageCachePathForBook(path);
   File f = FS.open(cachePath, "w");
@@ -931,90 +993,45 @@ static void savePageOffsetCacheForBook(const String& path, size_t fileSize) {
   f.close();
 }
 
-// Byte offset where the sentence begins that contains the character at `scanTop`
-// (the first byte on the reader page). Uses . ! ? and blank-line heuristics on
-// raw UTF-8 bytes; scans backward in chunks if needed.
-static uint32_t findSentenceStartContaining(File& f, size_t fileSize, uint32_t scanTop) {
-  static const uint32_t kMaxWindow = 1024;
-  if (fileSize == 0) return 0;
-  if (scanTop > fileSize) scanTop = (uint32_t)fileSize;
-  if (scanTop == 0) return 0;
-
-  auto isWs = [](char c) -> bool {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-  };
-  auto isCloser = [](char c) -> bool {
-    return c == '"' || c == '\'' || c == ')' || c == ']' || c == '\xBB';
-  };
-
-  // Keep this static and modest in size so settings POST handler
-  // does not blow task stack and reboot while WebUI is active.
-  static char buf[1024];
-
-  while (scanTop > 0) {
-    uint32_t windowStart = (scanTop > kMaxWindow) ? (scanTop - kMaxWindow) : 0;
-    uint32_t winLen = scanTop - windowStart;
-    if (winLen == 0) return windowStart;
-
-    if (winLen > sizeof(buf)) winLen = (uint32_t)sizeof(buf);
-    f.seek(windowStart);
-    int n = f.readBytes(buf, winLen);
-    if (n <= 0) return windowStart;
-
-    uint32_t relTop = scanTop - windowStart;
-    uint32_t bestRel = 0;
-    bool found = false;
-
-    for (uint32_t j = 0; j < relTop; j++) {
-      char c = buf[j];
-      if (j + 1 < (uint32_t)n && c == '\n' && buf[j + 1] == '\n') {
-        uint32_t k = j + 2;
-        while (k < (uint32_t)n && isWs(buf[k])) k++;
-        if (k <= relTop) {
-          bestRel = k;
-          found = true;
-        }
-        continue;
-      }
-      if (c != '.' && c != '!' && c != '?') continue;
-
-      uint32_t k = j + 1;
-      while (k < (uint32_t)n && isCloser(buf[k])) k++;
-      while (k < (uint32_t)n && isWs(buf[k])) k++;
-      if (k <= relTop) {
-        bestRel = k;
-        found = true;
-      }
-    }
-
-    if (found || windowStart == 0) {
-      return windowStart + bestRel;
-    }
-    scanTop = windowStart;
-  }
-  return 0;
-}
-
-static void invalidateAllPageCaches(uint32_t resumeFromByte) {
-  const uint32_t kReaderResumeUnset = 0xFFFFFFFFu;
+static void invalidateAllPageCaches() {
   // Page offsets are computed from the current font size and line spacing.
-  // When either changes, ALL cached offsets are invalid -- both the in-memory
-  // arrays and the on-disk .bin files. Saved page indices are reset because page
-  // numbers are layout-dependent. Optionally, the open reader can resume from a
-  // byte offset (sentence start at the top of the prior screen) so the user
-  // does not jump to the beginning of the book.
+  // When either changes, page numbers stored in prefs are stale (page N at
+  // font 8 != page N at font 12), but the BYTE OFFSET of the reader's last
+  // position is layout-independent. We keep that offset (in pref key "_o")
+  // and set a "needs relocation" flag ("_n") so the next open of each book
+  // re-derives its page number from the byte offset in the new layout.
+  // For bookmarks we mirror the same byte-offset-is-truth approach: keep
+  // bmOffsets[] (those still point to the correct text after the layout
+  // change) and let the stored page number become a stale fallback used
+  // only by readBookmarkLabelAtOffset() when seek() fails.
+
+  // Capture the currently open book's byte offset BEFORE we wipe in-memory
+  // pageOffsets[]. saveProgressThrottled keeps "_o" reasonably current, but
+  // the user may have turned pages since the last throttle fire.
+  uint32_t openBookOffset = 0;
+  bool haveOpenBookOffset = false;
+  if (g_reader.currentBookKey.length() > 0
+      && g_reader.pageIndex >= 0
+      && g_reader.pageIndex < g_reader.knownPages) {
+    openBookOffset = g_reader.pageOffsets[g_reader.pageIndex];
+    haveOpenBookOffset = true;
+    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), openBookOffset);
+  }
 
   resetOffsetCache();
 
-  // Remove all on-disk page-cache files (pc_*.bin)
+  // Remove all on-disk page-cache files (pc_*.bin).
+  // f.name() on arduino-esp32 3.x returns the BASENAME (no leading slash),
+  // so check both forms and rebuild the absolute path before remove().
   File root = FS.open("/");
   if (root && root.isDirectory()) {
     File f = root.openNextFile();
     while (f) {
-      String name = String(f.name());
-      bool removeIt = name.startsWith("/pc_") && name.endsWith(".bin");
+      String n = String(f.name());
+      String absPath = n.startsWith("/") ? n : ("/" + n);
+      bool removeIt = (n.startsWith("pc_") || n.startsWith("/pc_")) && n.endsWith(".bin");
       f.close();
-      if (removeIt) FS.remove(name);
+      if (removeIt) FS.remove(absPath);
       f = root.openNextFile();
     }
     root.close();
@@ -1022,46 +1039,39 @@ static void invalidateAllPageCaches(uint32_t resumeFromByte) {
     root.close();
   }
 
-  // Reset saved page progress and bookmark offsets for every book.
-  // Both page numbers and byte offsets are font-layout-dependent:
-  // page N and offset O at font 8 point to different text at font 12.
-  // Bookmark page numbers (uint16_t) are kept but offsets are set to
-  // 0xFFFFFFFF so resolveBookmarkOffset() recomputes them on next access.
+  // Mark every book as needing relocation on next open. We keep "_p" as-is
+  // (it's a hint and harmless if "_n" path overrides it) and rely on "_o" +
+  // the new layout to derive the correct page in openBookByIndex.
+  // Bookmarks are intentionally NOT touched: bmOffsets[] are still valid
+  // byte positions in the same file, so navigation lands on the right text.
+  // The stored bmPages[] page numbers are stale but only used by
+  // readBookmarkLabelAtOffset() as a fallback label ("p. N") when seek
+  // fails; in normal use the label is derived from the text at bmOffsets[j].
   for (int i = 0; i < g_library.bookCount; i++) {
     String key = prefKeyForBook(String(g_library.books[i].path));
-    prefs.putInt((key + "_p").c_str(), 0);
-
-    // Invalidate stored bookmark offsets (keep page numbers, clear byte offsets)
-    uint16_t bmPages[MAX_BOOKMARKS];
-    uint32_t bmOffsets[MAX_BOOKMARKS];
-    uint8_t bmCount = loadBookmarksForKey(key, bmPages, bmOffsets);
-    if (bmCount > 0) {
-      for (uint8_t j = 0; j < bmCount; j++) bmOffsets[j] = 0xFFFFFFFFUL;
-      saveBookmarksForKey(key, bmPages, bmOffsets, bmCount);
-    }
+    prefs.putBool((key + "_n").c_str(), true);
   }
 
-  // Reset the currently open book's in-memory state (page 0; optional byte offset).
+  // For the currently open book, reset in-memory pagination and relocate
+  // straight away using the byte offset we just captured. This avoids the
+  // user seeing page 1 momentarily before the next render.
   if (g_reader.currentBookPath.length() > 0) {
-    g_reader.pageIndex = 0;
     g_reader.knownPages = 1;
+    g_reader.pageOffsets[0] = 0;
+    g_reader.pageIndex = 0;
     g_reader.eofReached = false;
-
-    uint32_t start0 = 0;
-    if (resumeFromByte != kReaderResumeUnset && g_reader.file && !g_reader.file.isDirectory()) {
-      size_t sz = g_reader.file.size();
-      if (sz > 0) {
-        start0 = resumeFromByte;
-        if (start0 >= sz) start0 = (uint32_t)(sz - 1);
+    resetSaveThrottle();
+    if (haveOpenBookOffset && g_reader.file) {
+      relocateOpenBookToOffset(openBookOffset);
+      if (g_reader.currentBookKey.length() > 0) {
+        prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
+        if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
+          prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
+                        g_reader.pageOffsets[g_reader.pageIndex]);
+        }
+        prefs.remove((g_reader.currentBookKey + "_n").c_str());
       }
     }
-    g_reader.pageOffsets[0] = start0;
-
-    resetSaveThrottle();
-    if (g_reader.currentBookKey.length() > 0) {
-      prefs.putInt((g_reader.currentBookKey + "_p").c_str(), 0);
-    }
-    storeOffsetCache(g_reader.currentBookPath, 0, start0);
   }
 }
 
@@ -1109,6 +1119,10 @@ static void saveListItems() {
     strncpy((char*)&buf[pos], g_list.items[i].text, MAX_LIST_TEXT);
     pos += (MAX_LIST_TEXT + 1);
   }
+  // Skip the NVS write if nothing changed, to reduce flash wear.
+  uint8_t existing[1 + MAX_LIST_ITEMS * (1 + MAX_LIST_TEXT + 1)] = {0};
+  size_t got = prefs.getBytes("list_v1", existing, sizeof(existing));
+  if (got == pos && memcmp(existing, buf, pos) == 0) return;
   prefs.putBytes("list_v1", buf, pos);
 }
 
@@ -1318,6 +1332,7 @@ static String libraryEntryLabel(int idx) {
     case LIB_ENTRY_LIST:      return "List";
     case LIB_ENTRY_ABOUT:     return "Device";
     case LIB_ENTRY_UPLOAD:    return "Upload";
+    case LIB_ENTRY_APPS:      return "Apps";
   }
   return "";
 }
@@ -1377,6 +1392,12 @@ static void buildLibraryEntries() {
   }
   if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
     g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_ABOUT;
+    g_library.entryRefs[g_library.entryCount] = -1;
+    g_library.entryDepths[g_library.entryCount] = 0;
+    g_library.entryCount++;
+  }
+  if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
+    g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_APPS;
     g_library.entryRefs[g_library.entryCount] = -1;
     g_library.entryDepths[g_library.entryCount] = 0;
     g_library.entryCount++;
@@ -1488,12 +1509,18 @@ static String normalizeTypography(const String& in) {
 }
 
 // -------- Text compaction (storage optimization) --------
-static String compactText(const String& in) {
+// When called with state pointers, lastWasSpace / newlineCount are carried
+// across calls so streaming uploads collapse whitespace that spans chunk
+// boundaries. Pass trimTail=false on every chunk except the final one.
+static String compactText(const String& in,
+                          bool* ioLastWasSpace = nullptr,
+                          int* ioNewlineCount = nullptr,
+                          bool trimTail = true) {
   String out;
   out.reserve(in.length());
 
-  bool lastWasSpace = false;
-  int newlineCount = 0;
+  bool lastWasSpace = ioLastWasSpace ? *ioLastWasSpace : false;
+  int newlineCount = ioNewlineCount ? *ioNewlineCount : 0;
 
   for (size_t i = 0; i < in.length(); i++) {
     char c = in[i];
@@ -1525,9 +1552,14 @@ static String compactText(const String& in) {
     out += c;
   }
 
-  while (out.length() > 0 &&
-         (out[out.length() - 1] == ' ' || out[out.length() - 1] == '\n')) {
-    out.remove(out.length() - 1);
+  if (ioLastWasSpace) *ioLastWasSpace = lastWasSpace;
+  if (ioNewlineCount) *ioNewlineCount = newlineCount;
+
+  if (trimTail) {
+    while (out.length() > 0 &&
+           (out[out.length() - 1] == ' ' || out[out.length() - 1] == '\n')) {
+      out.remove(out.length() - 1);
+    }
   }
 
   return out;
@@ -1611,6 +1643,12 @@ static void saveProgressThrottled(bool force = false) {
   }
 
   prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
+  // Persist the byte offset of the current page so font / line-gap changes can
+  // re-locate the reader at the same text position in the new layout.
+  if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
+    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
+                  g_reader.pageOffsets[g_reader.pageIndex]);
+  }
   g_reader.lastSaveMs = millis();
   g_reader.lastSavedPage = g_reader.pageIndex;
 }
@@ -2113,6 +2151,14 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
     if (off <= startPos) off = startPos + 1;
     size_t sz = f.size();
     if (sz > 0 && off > sz) off = sz;
+    // Advance past UTF-8 continuation bytes (0b10xxxxxx) so the next page
+    // doesn't start mid-character. UTF-8 chars are at most 4 bytes.
+    for (int k = 0; k < 3 && off < sz; k++) {
+      if (!f.seek(off)) break;
+      int b = f.peek();
+      if (b < 0 || (b & 0xC0) != 0x80) break;
+      off++;
+    }
     return off;
   };
 
@@ -2289,6 +2335,31 @@ static void ensureOffsetsUpTo(int targetPage) {
   }
 }
 
+// Locate the page containing `targetOffset` in the current font layout, then
+// position pageIndex one page earlier than that containing page (a small
+// re-read so the user never skips past their last position). Walks pages
+// forward via ensureOffsetsUpTo(); falls back to the last known page on
+// EOF / MAX_PAGES cap. Pagination of a multi-MB book can take many seconds,
+// so we yield periodically to keep the task watchdog and HTTP server happy.
+static void relocateOpenBookToOffset(uint32_t targetOffset) {
+  if (targetOffset == 0) {
+    g_reader.pageIndex = 0;
+    return;
+  }
+
+  for (int k = 1; k < MAX_PAGES; k++) {
+    ensureOffsetsUpTo(k);
+    if ((k & 0x3F) == 0) yield();  // every 64 pages: feed WDT + service HTTP
+    if (g_reader.eofReached && (int)g_reader.knownPages <= k) break;
+    if (g_reader.pageOffsets[k] > targetOffset) {
+      int containing = k - 1;                                  // page that contains targetOffset
+      g_reader.pageIndex = (containing > 0) ? (containing - 1) : 0;  // one earlier, for re-read
+      return;
+    }
+  }
+  g_reader.pageIndex = (g_reader.knownPages > 0) ? (int)g_reader.knownPages - 1 : 0;
+}
+
 // ============================================================================
 //  Reader open / render
 // ============================================================================
@@ -2310,8 +2381,22 @@ static bool openBookByIndex(int idx) {
   g_reader.pageOffsets[0] = 0;
   g_reader.eofReached = false;
   loadPageOffsetCacheForBook(path, g_reader.file.size());
-  g_reader.pageIndex = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
-  if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
+  // If the layout changed since this book was last open ("_n" set by
+  // invalidateAllPageCaches), re-derive the page from the saved byte offset
+  // instead of trusting the now-stale "_p" page number.
+  if (prefs.getBool((g_reader.currentBookKey + "_n").c_str(), false)) {
+    uint32_t target = prefs.getUInt((g_reader.currentBookKey + "_o").c_str(), 0);
+    relocateOpenBookToOffset(target);
+    prefs.remove((g_reader.currentBookKey + "_n").c_str());
+    prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
+    if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
+      prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
+                    g_reader.pageOffsets[g_reader.pageIndex]);
+    }
+  } else {
+    g_reader.pageIndex = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
+    if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
+  }
   g_reader.pageTurnsSinceFull = 0;
   resetSaveThrottle();
   syncWakeState(true);
@@ -2528,6 +2613,7 @@ static void drawLibrary() {
     bool isSystem = (g_library.entryTypes[idx] == LIB_ENTRY_BOOKMARKS ||
                      g_library.entryTypes[idx] == LIB_ENTRY_LIST ||
                      g_library.entryTypes[idx] == LIB_ENTRY_ABOUT ||
+                     g_library.entryTypes[idx] == LIB_ENTRY_APPS ||
                      g_library.entryTypes[idx] == LIB_ENTRY_UPLOAD);
     bool boldText = (idx == g_library.selectedItem);
     drawMenuBulletRow(y, label, idx == g_library.selectedItem, boldText, g_library.entryDepths[idx], isSystem);
@@ -2625,6 +2711,320 @@ static void drawAbout() {
     u8g2.setFont(i == 0 ? BOLD_FONT : MAIN_FONT);
     u8g2.setCursor(MARGIN_X, y);
     u8g2.print(rows[i].c_str());
+    y += lineH;
+  }
+
+  display.update();
+}
+
+static void scanApps() {
+  g_apps.count = 0;
+
+  if (!FS.exists("/apps")) {
+    FS.mkdir("/apps");
+    return;
+  }
+
+  File dir = FS.open("/apps");
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    return;
+  }
+
+  File f = dir.openNextFile();
+  while (f && g_apps.count < MAX_APPS) {
+    String entryName = String(f.name());
+    f.close();
+
+    if (!entryName.endsWith(".bin")) {
+      f = dir.openNextFile();
+      continue;
+    }
+
+    String absPath = entryName.startsWith("/") ? entryName : (String("/apps/") + entryName);
+    AppDiscovery& entry = g_apps.apps[g_apps.count];
+
+    File hf = FS.open(absPath, "r");
+    bool usedHeader = false;
+    if (hf && hf.size() >= sizeof(PalaAppHeader)) {
+      PalaAppHeader hdr;
+      if (hf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr) &&
+          hdr.magic == PALA_APP_MAGIC) {
+        hdr.name[MAX_APP_NAME] = '\0';
+        strncpy(entry.name, hdr.name, MAX_APP_NAME);
+        entry.name[MAX_APP_NAME] = '\0';
+        usedHeader = true;
+      }
+    }
+    if (hf) hf.close();
+
+    if (!usedHeader) {
+      String stem = lastPathComponent(absPath);
+      if (stem.endsWith(".bin")) stem = stem.substring(0, stem.length() - 4);
+      stem.replace('_', ' ');
+      strncpy(entry.name, stem.c_str(), MAX_APP_NAME);
+      entry.name[MAX_APP_NAME] = '\0';
+    }
+
+    strncpy(entry.path, absPath.c_str(), MAX_APP_PATH);
+    entry.path[MAX_APP_PATH] = '\0';
+    g_apps.count++;
+
+    f = dir.openNextFile();
+  }
+  if (f) f.close();
+  dir.close();
+
+  if (g_apps.selectedIndex >= g_apps.count) g_apps.selectedIndex = 0;
+}
+
+// ---- PalaAPI wrapper implementations ----------------------------------------
+
+static void api_clearScreen() {
+  prepareMenuFrame();
+}
+
+static void api_drawHeader(const char* title) {
+  drawSectionHeader(title);
+}
+
+static void api_drawTextAt(int x, int y, const char* text, int bold) {
+  u8g2.setFont(bold ? BOLD_FONT : MAIN_FONT);
+  u8g2.setCursor(x, y);
+  u8g2.print(text);
+}
+
+static void api_drawCenteredLarge(const char* text) {
+  u8g2.setFont(u8g2_font_helvB14_te);
+  int w   = u8g2.getUTF8Width(text);
+  int asc = u8g2.getFontAscent();
+  // centre horizontally; vertically centred in the space below y=20 (approx header height)
+  u8g2.setCursor((SCREEN_W - w) / 2, (SCREEN_H + 20 + asc) / 2);
+  u8g2.print(text);
+  u8g2.setFont(MAIN_FONT);
+}
+
+static void api_refreshDisplay() {
+  display.update();
+}
+
+static uint8_t api_waitForEvent() {
+  markUserActivity();
+  while (true) {
+    btns.poll();
+    // Long press fires while the button is still held (not on release).
+    if (btns.pressArmed && btns.stablePressed) {
+      uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+      if ((uint32_t)(now - btns.pressStart) >= LONG_MS) {
+        btns.pressArmed = false;
+        btns.pressStart = 0;
+        markUserActivity();
+        return PALA_LONG;
+      }
+    }
+    if (btns.tripleClick) { btns.resetClicks(); markUserActivity(); return PALA_TRIPLE; }
+    if (btns.doubleClick) { btns.resetClicks(); markUserActivity(); return PALA_DOUBLE; }
+    if (btns.shortClick)  { btns.resetClicks(); markUserActivity(); return PALA_CLICK; }
+    delay(1);
+  }
+}
+
+static uint8_t api_pollEvent() {
+  btns.poll();
+  if (btns.longClick)   { btns.resetClicks(); markUserActivity(); return PALA_LONG; }
+  if (btns.tripleClick) { btns.resetClicks(); markUserActivity(); return PALA_TRIPLE; }
+  if (btns.doubleClick) { btns.resetClicks(); markUserActivity(); return PALA_DOUBLE; }
+  if (btns.shortClick)  { btns.resetClicks(); markUserActivity(); return PALA_CLICK; }
+  return 0;
+}
+
+static uint32_t api_millisNow() {
+  return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static int api_buttonPressed() {
+  return btns.stablePressed ? 1 : 0;
+}
+
+static void api_delayMs(uint32_t ms) {
+  delay(ms);
+}
+
+static uint32_t api_pendingPresses() {
+  btns.poll();
+  uint32_t n = btns.rawPressCount;
+  btns.rawPressCount = 0;
+  return n;
+}
+
+static uint32_t api_rtcSeconds() {
+  return (uint32_t)(esp_rtc_get_time_us() / 1000000ULL);
+}
+
+static int api_storageRead(const char* key, void* buf, int maxlen) {
+  char path[64];
+  snprintf(path, sizeof(path), "/apps/%s.dat", key);
+  File f = LittleFS.open(path, "r");
+  if (!f) return -1;
+  int n = f.read((uint8_t*)buf, maxlen);
+  f.close();
+  return n;
+}
+
+static int api_storageWrite(const char* key, const void* buf, int len) {
+  char path[64];
+  snprintf(path, sizeof(path), "/apps/%s.dat", key);
+  File f = LittleFS.open(path, "w");
+  if (!f) return -1;
+  int n = f.write((const uint8_t*)buf, len);
+  f.close();
+  return n;
+}
+
+static int api_snprintf_wrap(char* buf, int len, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  int r = vsnprintf(buf, (size_t)len, fmt, args);
+  va_end(args);
+  return r;
+}
+
+static void initPalaAPI() {
+  g_palaAPI.clearScreen       = api_clearScreen;
+  g_palaAPI.drawHeader        = api_drawHeader;
+  g_palaAPI.drawTextAt        = api_drawTextAt;
+  g_palaAPI.drawCenteredLarge = api_drawCenteredLarge;
+  g_palaAPI.refreshDisplay    = api_refreshDisplay;
+  g_palaAPI.waitForEvent      = api_waitForEvent;
+  g_palaAPI.snprintf_wrap     = api_snprintf_wrap;
+  g_palaAPI.pollEvent         = api_pollEvent;
+  g_palaAPI.millisNow         = api_millisNow;
+  g_palaAPI.buttonPressed     = api_buttonPressed;
+  g_palaAPI.delayMs           = api_delayMs;
+  g_palaAPI.pendingPresses    = api_pendingPresses;
+  g_palaAPI.storageRead       = api_storageRead;
+  g_palaAPI.storageWrite      = api_storageWrite;
+  g_palaAPI.rtcSeconds        = api_rtcSeconds;
+}
+
+// ---- App loader -------------------------------------------------------------
+
+static void freeAppExecBuf() {
+  if (g_appExecBuf) {
+    heap_caps_free(g_appExecBuf);
+    g_appExecBuf  = nullptr;
+    g_appExecSize = 0;
+  }
+}
+
+static bool loadAndRunApp(const char* path) {
+  freeAppExecBuf();
+
+  File f = FS.open(path, "r");
+  if (!f) { drawCenter("App not found", path); delay(1500); return false; }
+
+  size_t fileSize = f.size();
+  if (fileSize < sizeof(PalaAppHeader) + 4) {
+    f.close(); drawCenter("App too small", "Invalid file"); delay(1500); return false;
+  }
+
+  const size_t MAX_APP_BINARY = 48 * 1024;
+  if (fileSize > MAX_APP_BINARY) {
+    f.close(); drawCenter("App too large", "> 48 KB"); delay(1500); return false;
+  }
+
+  g_appExecBuf = heap_caps_malloc(fileSize, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
+  if (!g_appExecBuf) {
+    f.close();
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Need %u bytes", (unsigned)fileSize);
+    drawCenter("No exec memory", msg);
+    delay(1500);
+    return false;
+  }
+  g_appExecSize = fileSize;
+
+  // heap_caps_malloc(MALLOC_CAP_EXEC) returns an IRAM instruction-bus address (0x403xxxxx).
+  // On ESP32-S3 that address is not writable from the data bus; use the DIRAM DRAM view
+  // (same physical SRAM, shifted by SOC_I_D_OFFSET) for all reads and writes.
+  uint8_t* dataBuf = (uint8_t*)MAP_IRAM_TO_DRAM((uint32_t)g_appExecBuf);
+
+  size_t bytesRead = f.read(dataBuf, fileSize);
+  f.close();
+  if (bytesRead != fileSize) {
+    freeAppExecBuf(); drawCenter("Read error", "Partial read"); delay(1500); return false;
+  }
+
+  PalaAppHeader* hdr = (PalaAppHeader*)dataBuf;
+
+  if (hdr->magic != PALA_APP_MAGIC) {
+    freeAppExecBuf(); drawCenter("Bad app file", "Wrong magic"); delay(1500); return false;
+  }
+  if (hdr->api_version != PALA_API_VERSION) {
+    char msg[32];
+    snprintf(msg, sizeof(msg), "API v%u, need v%u",
+             (unsigned)hdr->api_version, (unsigned)PALA_API_VERSION);
+    freeAppExecBuf(); drawCenter("API mismatch", msg); delay(1500); return false;
+  }
+
+  if (hdr->entry_offset < sizeof(PalaAppHeader) || hdr->entry_offset >= fileSize) {
+    freeAppExecBuf(); drawCenter("Bad entry offset", nullptr); delay(1500); return false;
+  }
+
+  // l32r uses the instruction bus (can reach IRAM), but firmware data loads use the data
+  // bus (cannot reach IRAM). Relocations must therefore resolve to DRAM addresses so that
+  // string/data pointers passed to firmware API functions are data-bus accessible.
+  uint32_t base = (uint32_t)dataBuf;
+  if (hdr->reloc_count > 0) {
+    if (hdr->reloc_offset < sizeof(PalaAppHeader) ||
+        hdr->reloc_offset + hdr->reloc_count * 4u > fileSize) {
+      freeAppExecBuf(); drawCenter("Bad reloc table", nullptr); delay(1500); return false;
+    }
+    uint32_t* relocs = (uint32_t*)(dataBuf + hdr->reloc_offset);
+    for (uint32_t i = 0; i < hdr->reloc_count; i++) {
+      uint32_t off = relocs[i];
+      if (off + 4u > hdr->reloc_offset) {
+        freeAppExecBuf(); drawCenter("Reloc out of range", nullptr); delay(1500); return false;
+      }
+      *(uint32_t*)(dataBuf + off) += base;
+    }
+  }
+
+  pala_app_entry_t entry = (pala_app_entry_t)((uint8_t*)g_appExecBuf + hdr->entry_offset);
+
+  resetInputFrontend();
+  entry(&g_palaAPI);
+
+  freeAppExecBuf();
+  resetInputFrontend();
+  return true;
+}
+
+// ---- Apps menu draw / handle ------------------------------------------------
+
+static void drawAppsMenu() {
+  prepareMenuFrame();
+  u8g2.setFont(MAIN_FONT);
+  int ascent  = u8g2.getFontAscent();
+  int descent = u8g2.getFontDescent();
+  int lineH   = (ascent - descent) + g_settings.lineGap + 1;
+  int y = drawSectionHeader("Apps");
+
+  if (g_apps.count == 0) {
+    drawMenuBulletRow(y, "No apps installed", true, false, 0, false);
+    display.update();
+    return;
+  }
+
+  int visible = max(2, (SCREEN_H - y - BOT_PAD) / lineH);
+  int top     = g_apps.selectedIndex - (visible / 2);
+  top = max(0, min(top, g_apps.count - visible));
+
+  for (int i = 0; i < visible; i++) {
+    int idx = top + i;
+    if (idx >= g_apps.count) break;
+    bool sel = (idx == g_apps.selectedIndex);
+    drawMenuBulletRow(y, String(g_apps.apps[idx].name), sel, sel, 0, false);
     y += lineH;
   }
 
@@ -2827,7 +3227,6 @@ static String webPageStart(const String& title, const String& subtitle, const St
 static String webPageEnd() {
   return String("</div></body></html>");
 }
-
 static String htmlEscape(const String& in) {
   String out;
   out.reserve(in.length() + 16);
@@ -2955,6 +3354,15 @@ static void handleRoot() {
     "<div class='actions'><button type='submit'>Upload</button><a class='btn secondary' href='/files'>Manage files</a></div>"
     "</form></div>";
 
+  out +=
+    "<div class='card'><h2>Upload app (.bin)</h2>"
+    "<p class='muted'>Upload a Pala app binary compiled with the Pala SDK. "
+    "Files are stored in <b>/apps/</b> and appear in the Apps menu on the device.</p>"
+    "<form method='POST' action='/upload-app' enctype='multipart/form-data' style='margin-top:14px'>"
+    "<input type='file' name='file' accept='.bin,application/octet-stream' required>"
+    "<div class='actions'><button type='submit'>Upload app</button></div>"
+    "</form></div>";
+
   out += "<div class='card'><h2>Notes</h2><p class='muted'>Uploaded books are normalized and compacted before saving, so a source TXT can be larger than the final stored file. The reader is optimized for UTF-8 plain text and Latin-based languages.</p></div>";
 
   out += webPageEnd();
@@ -2995,8 +3403,8 @@ static void handleFiles() {
   out += "</div>";
 
   out += "<div class='card'><h2>Library files</h2>";
-  if (g_library.bookCount >= MAX_BOOKS) out += "<p class='text-err'>&#9888; Library full (80 books max). Delete books to make room.</p>";
-  if (g_library.folderCount >= MAX_FOLDERS) out += "<p class='text-err'>&#9888; Folder limit reached (32 max).</p>";
+  if (g_library.bookCount >= MAX_BOOKS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Library full (80 books max). Delete books to make room.</p>";
+  if (g_library.folderCount >= MAX_FOLDERS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Folder limit reached (32 max).</p>";
 
   if (g_library.bookCount == 0) {
     out += "<p class='muted'>No books uploaded yet.</p>";
@@ -3034,8 +3442,55 @@ static void handleFiles() {
   }
 
   out += "</div>";
+
+  out += "<div class='card'><h2>Apps</h2>";
+  {
+    File appsDir = FS.open("/apps");
+    bool anyApp = false;
+    if (appsDir) {
+      File f = appsDir.openNextFile();
+      while (f) {
+        String name = String(f.name());
+        if (name.endsWith(".bin")) {
+          if (!anyApp) { out += "<ul class='list'>"; anyApp = true; }
+          out += "<li><div class='row'><div><h3>";
+          out += htmlEscape(name);
+          out += "</h3><div class='meta'>";
+          out += String((int)f.size());
+          out += " bytes</div></div><div><form method='POST' action='/del-app' style='display:inline'>";
+          out += "<input type='hidden' name='name' value='";
+          out += htmlEscape(name);
+          out += "'><button type='submit' class='btn secondary' onclick=\"return confirm('Delete app?')\">Delete</button></form></div></div></li>";
+        }
+        f.close();
+        f = appsDir.openNextFile();
+      }
+      appsDir.close();
+    }
+    if (!anyApp) out += "<p class='muted'>No apps installed.</p>";
+    else out += "</ul>";
+  }
+  out += "</div>";
+
   out += webPageEnd();
   server.send(200, "text/html; charset=utf-8", out);
+}
+
+static void handleDeleteApp() {
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain; charset=utf-8", "missing name");
+    return;
+  }
+  String name = server.arg("name");
+  // reject anything with path separators
+  if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || !name.endsWith(".bin")) {
+    server.send(400, "text/plain; charset=utf-8", "invalid name");
+    return;
+  }
+  String path = "/apps/" + name;
+  FS.remove(path);
+  server.sendHeader("Location", "/files");
+  server.send(303);
 }
 
 static void handleDelete() {
@@ -4172,35 +4627,7 @@ static void handleSettingsPost() {
   }
 
   if (layoutChanged) {
-    const uint32_t kReaderResumeUnset = 0xFFFFFFFFu;
-    uint32_t resumeFrom = kReaderResumeUnset;
-
-    // Settings are often changed while the device is in MODE_UPLOAD (web UI).
-    // Capture anchor position whenever a current book exists, regardless of mode.
-    if (g_reader.currentBookPath.length() > 0) {
-      if ((!g_reader.file || g_reader.file.isDirectory()) && !reopenCurrentBookIfNeeded()) {
-        // No readable handle; leave resumeFrom unset so behavior falls back safely.
-      } else if (g_reader.file && !g_reader.file.isDirectory()) {
-      size_t bookSize = g_reader.file.size();
-      if (bookSize > 0) {
-        int pi = g_reader.pageIndex;
-        if (pi < 0) pi = 0;
-        ensureOffsetsUpTo(pi);
-        if (g_reader.knownPages > 0 && pi >= g_reader.knownPages) {
-          pi = g_reader.knownPages - 1;
-        }
-        uint32_t top = g_reader.pageOffsets[pi];
-        if (top < bookSize) {
-          resumeFrom = findSentenceStartContaining(g_reader.file, bookSize, top);
-        }
-      }
-      }
-    }
-
-    invalidateAllPageCaches(resumeFrom);
-    if (g_reader.file && g_reader.currentBookPath.length() > 0) {
-      savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
-    }
+    invalidateAllPageCaches();
     if (mode == MODE_READER || mode == MODE_BM_PREVIEW) {
       g_bookmarkUi.previewActive = false; // exit preview on layout change
       mode = MODE_READER;
@@ -4347,6 +4774,8 @@ static void handleUploadBookStream() {
     g_upload.bookFinalName = "";
     g_upload.bookPendingUtf8Tail = "";
     g_upload.bookTmpPath = "";
+    g_upload.bookCompactLastWasSpace = false;
+    g_upload.bookCompactNewlineCount = 0;
 
     loadBooks();
     if (g_library.bookCount >= MAX_BOOKS) {
@@ -4385,8 +4814,21 @@ static void handleUploadBookStream() {
       }
       if (chunk.length() > 0) {
         String cleaned = normalizeTypography(chunk);
-        cleaned = compactText(cleaned);
-        g_upload.bookTmpFile.print(cleaned);
+        cleaned = compactText(cleaned,
+                              &g_upload.bookCompactLastWasSpace,
+                              &g_upload.bookCompactNewlineCount,
+                              false);
+        size_t cleanedLen = cleaned.length();
+        size_t wrote = g_upload.bookTmpFile.print(cleaned);
+        if (wrote != cleanedLen) {
+          // Short write — out of space or FS error. Abort the upload so a
+          // truncated file isn't promoted to a finalized book.
+          g_upload.bookError = "Write failed (out of space?)";
+          g_upload.bookTmpFile.close();
+          if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) {
+            FS.remove(g_upload.bookTmpPath);
+          }
+        }
       }
     }
   }
@@ -4395,13 +4837,24 @@ static void handleUploadBookStream() {
     if (g_upload.bookTmpFile) {
       if (g_upload.bookPendingUtf8Tail.length() > 0) {
         String cleaned = normalizeTypography(g_upload.bookPendingUtf8Tail);
-        cleaned = compactText(cleaned);
-        g_upload.bookTmpFile.print(cleaned);
+        cleaned = compactText(cleaned,
+                              &g_upload.bookCompactLastWasSpace,
+                              &g_upload.bookCompactNewlineCount,
+                              true);
+        size_t cleanedLen = cleaned.length();
+        size_t wrote = g_upload.bookTmpFile.print(cleaned);
+        if (wrote != cleanedLen && g_upload.bookError.length() == 0) {
+          g_upload.bookError = "Write failed (out of space?)";
+        }
         g_upload.bookPendingUtf8Tail = "";
       }
       g_upload.bookTmpFile.close();
 
-      if (g_upload.bookTmpPath.length() > 0 && up.totalSize > 0) {
+      if (g_upload.bookError.length() > 0) {
+        if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) {
+          FS.remove(g_upload.bookTmpPath);
+        }
+      } else if (g_upload.bookTmpPath.length() > 0 && up.totalSize > 0) {
         String finalPath = g_upload.bookTmpPath.substring(0, g_upload.bookTmpPath.length() - 4);
         if (FS.exists(finalPath)) FS.remove(finalPath);
         if (FS.rename(g_upload.bookTmpPath, finalPath)) {
@@ -4521,13 +4974,111 @@ static void handleUploadSleepStream() {
   }
 }
 
+static void handleUploadAppDone() {
+  if (!g_upload.appOk) {
+    server.send(400, "text/plain; charset=utf-8",
+                g_upload.appError.length() ? g_upload.appError : "App upload failed");
+    return;
+  }
+  String inner;
+  inner.reserve(400);
+  inner += "<div class='card'><h2>App uploaded</h2>"
+           "<p class='muted'>App is now available in the Apps menu on the device.</p>"
+           "<div class='actions'><a class='btn' href='/'>Upload another</a></div></div>";
+  String page = successPage("App uploaded", "App saved.", "&#10003; App ready.", inner);
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+static void handleUploadAppStream() {
+  HTTPUpload& up = server.upload();
+
+  if (up.status == UPLOAD_FILE_START) {
+    g_upload.appOk = false;
+    g_upload.appError = "";
+    g_upload.appFinalName = "";
+    g_upload.appTmpPath = "";
+
+    size_t freeBytes = fsFreeBytesSafe();
+    if (freeBytes < 4096) {
+      g_upload.appError = "Not enough free space";
+      return;
+    }
+
+    // sanitizeUploadedFilename appends .txt; strip all extensions then re-add .bin
+    String fname = sanitizeUploadedFilename(up.filename);
+    int dot = fname.lastIndexOf('.');
+    while (dot > 0) { fname = fname.substring(0, dot); dot = fname.lastIndexOf('.'); }
+    if (fname.length() == 0) fname = "app";
+    fname += ".bin";
+
+    g_upload.appFinalName = fname;
+    g_upload.appTmpPath = "/apps/" + fname + ".tmp";
+    if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
+    g_upload.appTmpFile = FS.open(g_upload.appTmpPath, "w");
+    if (!g_upload.appTmpFile) {
+      g_upload.appError = "Cannot create temp app file";
+      g_upload.appTmpPath = "";
+    }
+  }
+  else if (up.status == UPLOAD_FILE_WRITE) {
+    if (g_upload.appError.length() > 0) return;
+    if (g_upload.appTmpFile) g_upload.appTmpFile.write(up.buf, up.currentSize);
+  }
+  else if (up.status == UPLOAD_FILE_END) {
+    if (g_upload.appTmpFile) g_upload.appTmpFile.close();
+    if (g_upload.appError.length() > 0 || g_upload.appTmpPath.length() == 0) return;
+
+    if (up.totalSize < sizeof(PalaAppHeader) + 4) {
+      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
+      g_upload.appError = "App binary too small";
+      g_upload.appTmpPath = "";
+      return;
+    }
+
+    // Validate magic before committing
+    bool validMagic = false;
+    File vf = FS.open(g_upload.appTmpPath, "r");
+    if (vf) {
+      PalaAppHeader hdr;
+      if (vf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr))
+        validMagic = (hdr.magic == PALA_APP_MAGIC);
+      vf.close();
+    }
+    if (!validMagic) {
+      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
+      g_upload.appError = "Invalid app binary (bad magic)";
+      g_upload.appTmpPath = "";
+      return;
+    }
+
+    String finalPath = "/apps/" + g_upload.appFinalName;
+    if (FS.exists(finalPath)) FS.remove(finalPath);
+    if (FS.rename(g_upload.appTmpPath, finalPath)) {
+      g_upload.appOk = true;
+    } else {
+      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
+      g_upload.appError = "Failed to finalize app upload";
+    }
+    g_upload.appTmpPath = "";
+  }
+  else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (g_upload.appTmpFile) g_upload.appTmpFile.close();
+    if (g_upload.appTmpPath.length() > 0 && FS.exists(g_upload.appTmpPath))
+      FS.remove(g_upload.appTmpPath);
+    g_upload.appTmpPath = "";
+    g_upload.appOk = false;
+    g_upload.appError = "Upload aborted";
+  }
+}
+
 // ============================================================================
 //  Upload mode / server lifecycle
 // ============================================================================
 static void registerWebRoutes() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/files", HTTP_GET, handleFiles);
-  server.on("/del",   HTTP_POST, handleDelete);   // POST: prevents accidental deletion via browser prefetch
+  server.on("/del",     HTTP_POST, handleDelete);   // POST: prevents accidental deletion via browser prefetch
+  server.on("/del-app", HTTP_POST, handleDeleteApp);
   server.on("/mkdir", HTTP_POST, handleCreateFolder);
   server.on("/move", HTTP_POST, handleMoveBook);
   server.on("/jumppage", HTTP_POST, handleJumpPageWeb);
@@ -4552,6 +5103,7 @@ static void registerWebRoutes() {
 
   server.on("/upload-sleep", HTTP_POST, handleUploadSleepDone, handleUploadSleepStream);
   server.on("/upload-sleep-slot", HTTP_POST, handleUploadSleepSlotDone, handleUploadSleepStream);
+  server.on("/upload-app",   HTTP_POST, handleUploadAppDone,   handleUploadAppStream);
   server.on("/upload", HTTP_POST, handleUploadDone, handleUploadBookStream);
 }
 
@@ -4607,8 +5159,9 @@ static void startUploadMode() {
 static void stopUploadModeToLibrary() {
   server.stop();
 
-  if (g_upload.bookTmpFile) g_upload.bookTmpFile.close();
+  if (g_upload.bookTmpFile)  g_upload.bookTmpFile.close();
   if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.close();
+  if (g_upload.appTmpFile)   g_upload.appTmpFile.close();
 
   WiFi.softAPdisconnect(true);
   WiFi.disconnect(true, true);
@@ -4628,6 +5181,11 @@ static void stopUploadModeToLibrary() {
   g_upload.sleepTmpPath = "";
   g_upload.sleepSlotUpload = false;
   g_upload.sleepSlotTarget = -1;
+
+  g_upload.appOk = false;
+  g_upload.appError = "";
+  g_upload.appTmpPath = "";
+  g_upload.appFinalName = "";
 
   loadBooks();
   mode = MODE_LIBRARY;
@@ -4767,6 +5325,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BTN), btnISR, CHANGE);
 
   u8g2.begin(gfx);
+  initPalaAPI();
   invalidateMetrics();
   (void)getMetrics();
   resetOffsetCache();
@@ -4785,6 +5344,7 @@ void setup() {
     return;
   }
   ensureBooksDir();
+  if (!FS.exists("/apps")) FS.mkdir("/apps");
 
   {
     uint64_t chipId = ESP.getEfuseMac();
@@ -4841,6 +5401,23 @@ static void handleModeAbout() {
     mode = MODE_LIBRARY;
     drawLibrary();
   }
+}
+
+static void handleModeApps() {
+  if (btns.shortClick) {
+    if (g_apps.count > 0)
+      g_apps.selectedIndex = (g_apps.selectedIndex + 1) % g_apps.count;
+    drawAppsMenu();
+    return;
+  }
+  if (btns.doubleClick) {
+    if (g_apps.count > 0 && g_apps.selectedIndex < g_apps.count) {
+      loadAndRunApp(g_apps.apps[g_apps.selectedIndex].path);
+      drawAppsMenu();
+    }
+    return;
+  }
+  // Triple-click handled globally → library root
 }
 
 static void handleModeBookmarkBookSelect() {
@@ -5038,6 +5615,14 @@ static void handleModeLibrary() {
     return;
   }
 
+  if (entryType == LIB_ENTRY_APPS) {
+    g_apps.selectedIndex = 0;
+    scanApps();
+    mode = MODE_APPS;
+    drawAppsMenu();
+    return;
+  }
+
   startUploadMode();
 }
 
@@ -5163,6 +5748,7 @@ void loop() {
     case MODE_UPLOAD:         handleModeUpload(); break;
     case MODE_ABOUT:          handleModeAbout(); break;
     case MODE_LIST:           handleModeList(); break;
+    case MODE_APPS:           handleModeApps(); break;
     case MODE_BM_BOOK_SELECT: handleModeBookmarkBookSelect(); break;
     case MODE_BM_LIST:        handleModeBookmarkList(); break;
     case MODE_BM_PREVIEW:     handleModeBookmarkPreview(); break;
