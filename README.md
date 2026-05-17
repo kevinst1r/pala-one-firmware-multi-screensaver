@@ -37,7 +37,7 @@ This fork includes multiple firmware and WebUI improvements for the Heltec V1.2 
 - Bionic Reading toggle in settings (bold word starts for faster scanning)
 - Reading font dropdown with `Default` and `OpenDyslexia` options (see below)
 - Dark mode toggle in WebUI
-- Reading-location retention on layout changes so font/font-size/line-spacing updates keep the user near the same sentence instead of jumping to page 1
+- Reading-location retention on layout changes so font/font-size/line-spacing updates keep the user near the same sentence instead of jumping to page 1* (*Haven't re-added yet.  Need to test new firmware version first)
 - Single and multi screensaver modes in the WebUI Settings page
 - Mode-specific UI (single mode and multi mode are shown separately)
 - Multi-screensaver rotation list with per-image thumbnail previews
