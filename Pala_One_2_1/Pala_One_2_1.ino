@@ -25,7 +25,7 @@
 
 // ── Board selection: uncomment the line that matches your hardware ──────────
 // #define BOARD_V1_1
-#define BOARD_V1_2
+// #define BOARD_V1_2
 // ────────────────────────────────────────────────────────────────────────────
 
 // When built with PlatformIO, WIRELESS_PAPER + DISPLAY_V1_x come from
