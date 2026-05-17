@@ -97,7 +97,7 @@ cmake -S test -B test/build && cmake --build test/build && ctest --test-dir test
 
 Pala One supports user-installable apps — self-contained position-independent C binaries that run on top of the firmware and have access to the display, button, RTC, and a per-app key-value store. Apps are uploaded over Wi-Fi through the same web UI used for books, and they appear under the **Apps** entry of the library menu. No firmware rebuild is needed to install one.
 
-See [docs/APPS.md](docs/APPS.md) for the full app-author guide — binary format, the `PalaAPI` (v3), required compiler flags, and upload steps.
+See [examples/GETTING_STARTED.md](examples/GETTING_STARTED.md) for the full app-author guide — binary format, the `PalaAPI` (v3), required compiler flags, and upload steps.
 
 ### Building an app
 
