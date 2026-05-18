@@ -131,6 +131,58 @@ This fork includes multiple firmware and WebUI improvements for the Heltec V1.2 
 - Single custom screensaver also shows a thumbnail with inline remove action
 - Screensaver thumbnails are generated on-device using the same bitmap pipeline as displayed images
 - Built-in WebUI screensaver editor (phone/browser-side processing, no on-device image conversion)
+- **Find** web book viewer on the Files page (read and search books in the browser)
+
+### Find (web book viewer)
+
+On the device, connect to upload WiFi (`PALA-XXXXXX` / `palaread`), open `http://192.168.4.1`, and go to **Files**. Each book has **Jump** (set device page) and **Find** (open the browser reader).
+
+#### Opening Find
+
+1. Open **Files** in the WebUI.
+2. Next to the page number field, tap **Find** (or open `/read?id=N` where `N` is the book index in the library list).
+
+The page title is **Find**. The book name appears as the subtitle.
+
+#### Reading in the browser
+
+- **Font size** — slider (14–28 px); choice is remembered in the browser.
+- **Paragraph breaks** — line breaks from the stored `.txt` file are preserved in the preview.
+- Text is split into tappable **sentences** for precise jump targets.
+
+#### Search
+
+- Type in the search box and use:
+  - **Find** — start a new search and go to the first match
+  - **Find next** / **Find previous** — move through matches (wraps at the ends)
+- All matching sentences are highlighted; the current match has a stronger outline.
+- Press **Enter** in the search box to run **Find**.
+
+#### Select furthest progress
+
+- Button on its own row **above** the book text.
+- Jumps to the sentence at the **furthest page you have reached on the device**, not your current bookmark.
+- Furthest progress is tracked separately (`_mp` page + `_mo` byte offset) and only moves forward when you read ahead on the device.
+- If you have read far on the device before, the firmware may also infer progress from the page-offset cache (`/pc_*.bin`).
+- The matching sentence is **selected** (same highlight as a tap). Use the **Jump** bar at the bottom to save that position to the device.
+
+#### Jump to a sentence on the device
+
+1. Tap any sentence in the preview.
+2. Tap **Jump** in the bar that appears at the bottom of the screen.
+3. The device will open that book near the page containing that sentence the next time you read it on e-ink.
+
+This saves both page index and byte offset in NVS, so layout changes (font size, line gap) can still relocate you correctly.
+
+#### Related WebUI routes
+
+| Route | Purpose |
+|---|---|
+| `GET /read?id=N` | Find reader page |
+| `GET /readbook-text?id=N` | Raw book text for the reader |
+| `GET /readbook-max-progress?id=N` | Furthest progress offset, page, and whether it differs from current |
+| `GET /readbook-page-offset?id=N&page=P` | Byte offset for device page `P` |
+| `POST /jumpoffset` | Save sentence byte offset as device reading position |
 
 ### OpenDyslexia reading font
 

@@ -6,7 +6,7 @@
 
 // ── Board selection: uncomment the line that matches your hardware ────────────
 // #define BOARD_V1_1
-// #define BOARD_V1_2
+#define BOARD_V1_2
 // ─────────────────────────────────────────────────────────────────────────────
 #ifdef BOARD_V1_1
   using DisplayType = EInkDisplay_WirelessPaperV1_1;
@@ -361,6 +361,20 @@ static const char* AP_PASS = "palaread";
 
 static const uint8_t BTN_Q = 64;
 static const uint32_t BTN_QUEUE_RECOVER_THRESHOLD = 10;
+static const int LAYOUT_INV_FS_FILES_PER_TICK = 3;
+static const int LAYOUT_INV_BOOKS_PER_TICK = 4;
+
+struct LayoutInvalidateState {
+  bool active = false;
+  uint8_t phase = 0;  // 0=setup, 1=fs scan, 2=mark books, 3=open book, 4=done
+  File root;
+  int bookIdx = 0;
+  uint32_t openBookOffset = 0;
+  bool haveOpenBookOffset = false;
+};
+static LayoutInvalidateState g_layoutInv;
+static bool g_renderAfterLayoutInvalidate = false;
+
 volatile uint8_t btnQHead = 0;
 volatile uint8_t btnQTail = 0;
 volatile bool btnQState[BTN_Q];
@@ -418,7 +432,8 @@ static void idlePrefetchReader();
 static String pageCachePathForBook(const String& path);
 static bool loadPageOffsetCacheForBook(const String& path, size_t expectedSize);
 static void savePageOffsetCacheForBook(const String& path, size_t fileSize);
-static void invalidateAllPageCaches();
+static void requestInvalidateAllPageCaches();
+static bool tickInvalidateAllPageCaches();
 static void relocateOpenBookToOffset(uint32_t targetOffset);
 static uint32_t resolveBookmarkOffset(const String& path, uint16_t page, uint32_t storedOffset);
 static String readPageTextForWeb(const String& path, int page);
@@ -936,6 +951,127 @@ static int savedPageForBookPath(const String& path) {
   return (p < 0) ? 0 : p;
 }
 
+static bool readPageCacheHeader(const String& path, size_t expectedSize, uint16_t& outCount) {
+  String cachePath = pageCachePathForBook(path);
+  File f = FS.open(cachePath, "r");
+  if (!f) return false;
+
+  uint32_t magic = 0;
+  uint32_t fileSize = 0;
+  uint16_t count = 0;
+
+  if (f.read((uint8_t*)&magic, sizeof(magic)) != sizeof(magic)) { f.close(); return false; }
+  if (f.read((uint8_t*)&fileSize, sizeof(fileSize)) != sizeof(fileSize)) { f.close(); return false; }
+  if (f.read((uint8_t*)&count, sizeof(count)) != sizeof(count)) { f.close(); return false; }
+  f.close();
+
+  if (magic != 0x50434F46UL || fileSize != (uint32_t)expectedSize || count == 0) return false;
+  outCount = count;
+  return true;
+}
+
+static int pageCacheCountForBook(const String& path, size_t expectedSize) {
+  uint16_t count = 0;
+  if (!readPageCacheHeader(path, expectedSize, count)) return 0;
+  return (int)count;
+}
+
+static bool pageCacheOffsetForPage(const String& path, size_t expectedSize, int page, uint32_t& outOffset) {
+  if (page < 0) return false;
+
+  String cachePath = pageCachePathForBook(path);
+  File f = FS.open(cachePath, "r");
+  if (!f) return false;
+
+  uint32_t magic = 0;
+  uint32_t fileSize = 0;
+  uint16_t count = 0;
+
+  if (f.read((uint8_t*)&magic, sizeof(magic)) != sizeof(magic)) { f.close(); return false; }
+  if (f.read((uint8_t*)&fileSize, sizeof(fileSize)) != sizeof(fileSize)) { f.close(); return false; }
+  if (f.read((uint8_t*)&count, sizeof(count)) != sizeof(count)) { f.close(); return false; }
+  if (magic != 0x50434F46UL || fileSize != (uint32_t)expectedSize || page >= (int)count) {
+    f.close();
+    return false;
+  }
+
+  size_t entryPos = 10 + ((size_t)page * sizeof(uint32_t));
+  if (!f.seek(entryPos)) { f.close(); return false; }
+  uint32_t off = 0;
+  if (f.read((uint8_t*)&off, sizeof(off)) != sizeof(off)) { f.close(); return false; }
+  f.close();
+
+  outOffset = off;
+  return true;
+}
+
+static int savedMaxPageForBookPath(const String& path) {
+  String key = prefKeyForBook(path);
+  int mp = prefs.getInt((key + "_mp").c_str(), -1);
+  if (mp >= 0) return mp;
+  return savedPageForBookPath(path);
+}
+
+static void updateMaxProgressForKey(const String& key, int pageIndex, uint32_t byteOffset) {
+  if (key.length() == 0 || pageIndex < 0) return;
+
+  int maxP = prefs.getInt((key + "_mp").c_str(), -1);
+  uint32_t maxO = prefs.getUInt((key + "_mo").c_str(), 0);
+
+  bool advance = (pageIndex > maxP) || (pageIndex == maxP && byteOffset > maxO) || (maxP < 0);
+  if (!advance) return;
+
+  prefs.putInt((key + "_mp").c_str(), pageIndex);
+  prefs.putUInt((key + "_mo").c_str(), byteOffset);
+}
+
+// Resolve furthest reading progress: stored _mp/_mo, or page-cache depth if further than _p.
+static bool resolveMaxProgressForBook(const String& path, int& outPage, uint32_t& outOffset) {
+  String key = prefKeyForBook(path);
+  int curP = prefs.getInt((key + "_p").c_str(), 0);
+  if (curP < 0) curP = 0;
+  uint32_t curO = prefs.getUInt((key + "_o").c_str(), 0);
+
+  int maxP = prefs.getInt((key + "_mp").c_str(), -1);
+  uint32_t maxO = prefs.getUInt((key + "_mo").c_str(), 0);
+  bool haveStoredMax = prefs.isKey((key + "_mp").c_str());
+
+  File f = FS.open(path, "r");
+  if (!f) {
+    outPage = curP;
+    outOffset = curO;
+    return false;
+  }
+  size_t fileSize = f.size();
+
+  int cacheCount = pageCacheCountForBook(path, fileSize);
+  if (cacheCount > 0) {
+    int cacheMaxPage = cacheCount - 1;
+    if (!haveStoredMax || cacheMaxPage > maxP) {
+      maxP = cacheMaxPage;
+      if (!pageCacheOffsetForPage(path, fileSize, maxP, maxO)) {
+        maxO = pageOffsetForPage(f, path, maxP);
+      }
+      haveStoredMax = true;
+      prefs.putInt((key + "_mp").c_str(), maxP);
+      prefs.putUInt((key + "_mo").c_str(), maxO);
+    }
+  }
+
+  if (!haveStoredMax) {
+    maxP = curP;
+    maxO = curO;
+    if (maxO == 0) maxO = pageOffsetForPage(f, path, maxP);
+  } else if (maxO == 0) {
+    maxO = pageOffsetForPage(f, path, maxP);
+  }
+
+  f.close();
+  outPage = maxP;
+  outOffset = maxO;
+  return (maxP > curP) || (maxO > curO + 32);
+}
+
 static String pageCachePathForBook(const String& path) {
   return String("/pc_") + prefKeyForBook(path) + ".bin";
 }
@@ -993,76 +1129,15 @@ static void savePageOffsetCacheForBook(const String& path, size_t fileSize) {
   f.close();
 }
 
-static void invalidateAllPageCaches() {
-  // Page offsets are computed from the current font size and line spacing.
-  // When either changes, page numbers stored in prefs are stale (page N at
-  // font 8 != page N at font 12), but the BYTE OFFSET of the reader's last
-  // position is layout-independent. We keep that offset (in pref key "_o")
-  // and set a "needs relocation" flag ("_n") so the next open of each book
-  // re-derives its page number from the byte offset in the new layout.
-  // For bookmarks we mirror the same byte-offset-is-truth approach: keep
-  // bmOffsets[] (those still point to the correct text after the layout
-  // change) and let the stored page number become a stale fallback used
-  // only by readBookmarkLabelAtOffset() when seek() fails.
-
-  // Capture the currently open book's byte offset BEFORE we wipe in-memory
-  // pageOffsets[]. saveProgressThrottled keeps "_o" reasonably current, but
-  // the user may have turned pages since the last throttle fire.
-  uint32_t openBookOffset = 0;
-  bool haveOpenBookOffset = false;
-  if (g_reader.currentBookKey.length() > 0
-      && g_reader.pageIndex >= 0
-      && g_reader.pageIndex < g_reader.knownPages) {
-    openBookOffset = g_reader.pageOffsets[g_reader.pageIndex];
-    haveOpenBookOffset = true;
-    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), openBookOffset);
-  }
-
-  resetOffsetCache();
-
-  // Remove all on-disk page-cache files (pc_*.bin).
-  // f.name() on arduino-esp32 3.x returns the BASENAME (no leading slash),
-  // so check both forms and rebuild the absolute path before remove().
-  File root = FS.open("/");
-  if (root && root.isDirectory()) {
-    File f = root.openNextFile();
-    while (f) {
-      String n = String(f.name());
-      String absPath = n.startsWith("/") ? n : ("/" + n);
-      bool removeIt = (n.startsWith("pc_") || n.startsWith("/pc_")) && n.endsWith(".bin");
-      f.close();
-      if (removeIt) FS.remove(absPath);
-      f = root.openNextFile();
-    }
-    root.close();
-  } else if (root) {
-    root.close();
-  }
-
-  // Mark every book as needing relocation on next open. We keep "_p" as-is
-  // (it's a hint and harmless if "_n" path overrides it) and rely on "_o" +
-  // the new layout to derive the correct page in openBookByIndex.
-  // Bookmarks are intentionally NOT touched: bmOffsets[] are still valid
-  // byte positions in the same file, so navigation lands on the right text.
-  // The stored bmPages[] page numbers are stale but only used by
-  // readBookmarkLabelAtOffset() as a fallback label ("p. N") when seek
-  // fails; in normal use the label is derived from the text at bmOffsets[j].
-  for (int i = 0; i < g_library.bookCount; i++) {
-    String key = prefKeyForBook(String(g_library.books[i].path));
-    prefs.putBool((key + "_n").c_str(), true);
-  }
-
-  // For the currently open book, reset in-memory pagination and relocate
-  // straight away using the byte offset we just captured. This avoids the
-  // user seeing page 1 momentarily before the next render.
+static void finishLayoutInvalidateOpenBook() {
   if (g_reader.currentBookPath.length() > 0) {
     g_reader.knownPages = 1;
     g_reader.pageOffsets[0] = 0;
     g_reader.pageIndex = 0;
     g_reader.eofReached = false;
     resetSaveThrottle();
-    if (haveOpenBookOffset && g_reader.file) {
-      relocateOpenBookToOffset(openBookOffset);
+    if (g_layoutInv.haveOpenBookOffset && g_reader.file) {
+      relocateOpenBookToOffset(g_layoutInv.openBookOffset);
       if (g_reader.currentBookKey.length() > 0) {
         prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
         if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
@@ -1073,6 +1148,93 @@ static void invalidateAllPageCaches() {
       }
     }
   }
+}
+
+static void cancelLayoutInvalidateWork() {
+  if (g_layoutInv.root) {
+    g_layoutInv.root.close();
+    g_layoutInv.root = File();
+  }
+  g_layoutInv.active = false;
+  g_layoutInv.phase = 0;
+  g_layoutInv.bookIdx = 0;
+  g_layoutInv.openBookOffset = 0;
+  g_layoutInv.haveOpenBookOffset = false;
+}
+
+static void requestInvalidateAllPageCaches() {
+  cancelLayoutInvalidateWork();
+  g_layoutInv.active = true;
+  g_layoutInv.phase = 0;
+}
+
+// Page-offset cache invalidation spread across loop() ticks so HTTP handlers
+// and button polling stay responsive (e.g. saving font settings in upload mode).
+static bool tickInvalidateAllPageCaches() {
+  if (!g_layoutInv.active) return true;
+
+  if (g_layoutInv.phase == 0) {
+    g_layoutInv.openBookOffset = 0;
+    g_layoutInv.haveOpenBookOffset = false;
+    if (g_reader.currentBookKey.length() > 0
+        && g_reader.pageIndex >= 0
+        && g_reader.pageIndex < g_reader.knownPages) {
+      g_layoutInv.openBookOffset = g_reader.pageOffsets[g_reader.pageIndex];
+      g_layoutInv.haveOpenBookOffset = true;
+      prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), g_layoutInv.openBookOffset);
+    }
+    resetOffsetCache();
+    g_layoutInv.bookIdx = 0;
+    g_layoutInv.root = FS.open("/");
+    if (g_layoutInv.root && g_layoutInv.root.isDirectory()) {
+      g_layoutInv.phase = 1;
+    } else {
+      if (g_layoutInv.root) g_layoutInv.root.close();
+      g_layoutInv.root = File();
+      g_layoutInv.phase = 2;
+    }
+    return false;
+  }
+
+  if (g_layoutInv.phase == 1) {
+    for (int n = 0; n < LAYOUT_INV_FS_FILES_PER_TICK; n++) {
+      File f = g_layoutInv.root.openNextFile();
+      if (!f) {
+        g_layoutInv.root.close();
+        g_layoutInv.root = File();
+        g_layoutInv.phase = 2;
+        return false;
+      }
+      String name = String(f.name());
+      String absPath = name.startsWith("/") ? name : ("/" + name);
+      bool removeIt = (name.startsWith("pc_") || name.startsWith("/pc_")) && name.endsWith(".bin");
+      f.close();
+      if (removeIt) FS.remove(absPath);
+    }
+    return false;
+  }
+
+  if (g_layoutInv.phase == 2) {
+    int end = min(g_layoutInv.bookIdx + LAYOUT_INV_BOOKS_PER_TICK, g_library.bookCount);
+    for (int i = g_layoutInv.bookIdx; i < end; i++) {
+      String key = prefKeyForBook(String(g_library.books[i].path));
+      prefs.putBool((key + "_n").c_str(), true);
+    }
+    g_layoutInv.bookIdx = end;
+    if (g_layoutInv.bookIdx < g_library.bookCount) return false;
+    g_layoutInv.phase = 3;
+  }
+
+  if (g_layoutInv.phase == 3) {
+    finishLayoutInvalidateOpenBook();
+    cancelLayoutInvalidateWork();
+    if (g_renderAfterLayoutInvalidate) {
+      g_renderAfterLayoutInvalidate = false;
+      if (mode == MODE_READER || mode == MODE_BM_PREVIEW) renderCurrentPage();
+    }
+  }
+
+  return true;
 }
 
 static void sanitizeListText(String& s) {
@@ -1140,6 +1302,10 @@ static String bmKeyFor(const String& bookKey) {
 static void deleteBookMetadata(const String& path) {
   String key = prefKeyForBook(path);
   prefs.remove((key + "_p").c_str());
+  prefs.remove((key + "_o").c_str());
+  prefs.remove((key + "_mp").c_str());
+  prefs.remove((key + "_mo").c_str());
+  prefs.remove((key + "_n").c_str());
   prefs.remove(bmKeyFor(key).c_str());
   String cachePath = pageCachePathForBook(path);
   if (FS.exists(cachePath)) FS.remove(cachePath);
@@ -1157,6 +1323,29 @@ static void migrateBookMetadata(const String& oldPath, const String& newPath) {
   if (progress >= 0) {
     prefs.putInt((newKey + "_p").c_str(), progress);
     prefs.remove((oldKey + "_p").c_str());
+  }
+
+  int maxProgress = prefs.getInt((oldKey + "_mp").c_str(), -1);
+  if (maxProgress >= 0) {
+    prefs.putInt((newKey + "_mp").c_str(), maxProgress);
+    prefs.remove((oldKey + "_mp").c_str());
+  }
+
+  if (prefs.isKey((oldKey + "_mo").c_str())) {
+    uint32_t maxOff = prefs.getUInt((oldKey + "_mo").c_str(), 0);
+    prefs.putUInt((newKey + "_mo").c_str(), maxOff);
+    prefs.remove((oldKey + "_mo").c_str());
+  }
+
+  uint32_t savedOff = prefs.getUInt((oldKey + "_o").c_str(), 0xFFFFFFFFUL);
+  if (savedOff != 0xFFFFFFFFUL) {
+    prefs.putUInt((newKey + "_o").c_str(), savedOff);
+    prefs.remove((oldKey + "_o").c_str());
+  }
+
+  if (prefs.getBool((oldKey + "_n").c_str(), false)) {
+    prefs.putBool((newKey + "_n").c_str(), true);
+    prefs.remove((oldKey + "_n").c_str());
   }
 
   uint8_t buf[1 + MAX_BOOKMARKS * 6] = {0};
@@ -1646,8 +1835,9 @@ static void saveProgressThrottled(bool force = false) {
   // Persist the byte offset of the current page so font / line-gap changes can
   // re-locate the reader at the same text position in the new layout.
   if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                  g_reader.pageOffsets[g_reader.pageIndex]);
+    uint32_t curOff = g_reader.pageOffsets[g_reader.pageIndex];
+    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), curOff);
+    updateMaxProgressForKey(g_reader.currentBookKey, g_reader.pageIndex, curOff);
   }
   g_reader.lastSaveMs = millis();
   g_reader.lastSavedPage = g_reader.pageIndex;
@@ -2406,6 +2596,14 @@ static bool openBookByIndex(int idx) {
   int warmTarget = g_reader.pageIndex + PREFETCH_AHEAD_PAGES;
   if (warmTarget < 1) warmTarget = 1;
   ensureOffsetsUpTo(warmTarget);
+
+  if (!prefs.isKey((g_reader.currentBookKey + "_mp").c_str())) {
+    uint32_t curOff = 0;
+    if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
+      curOff = g_reader.pageOffsets[g_reader.pageIndex];
+    }
+    updateMaxProgressForKey(g_reader.currentBookKey, g_reader.pageIndex, curOff);
+  }
   return true;
 }
 
@@ -3315,6 +3513,156 @@ static String readPageTextForWeb(const String& path, int page) {
   return out;
 }
 
+static int pageIndexForByteOffset(const String& path, uint32_t targetOffset) {
+  if (targetOffset == 0) return 0;
+
+  File f = FS.open(path, "r");
+  if (!f) return 0;
+
+  size_t fileSize = f.size();
+  if (fileSize > 0 && targetOffset >= fileSize) targetOffset = (uint32_t)(fileSize - 1);
+
+  int page = 0;
+  uint32_t off = 0;
+  while (off < targetOffset && page < MAX_PAGES - 1) {
+    uint32_t next = buildNextOffsetFor(f, off);
+    if (next <= off) break;
+    if (next > targetOffset) {
+      f.close();
+      return page;
+    }
+    off = next;
+    page++;
+    if ((page & 0x3F) == 0) yield();
+  }
+
+  f.close();
+  return page;
+}
+
+static void setBookReadingPosition(const String& path, int pageIndex, uint32_t byteOffset) {
+  String key = prefKeyForBook(path);
+  if (pageIndex < 0) pageIndex = 0;
+  prefs.putInt((key + "_p").c_str(), pageIndex);
+  prefs.putUInt((key + "_o").c_str(), byteOffset);
+  updateMaxProgressForKey(key, pageIndex, byteOffset);
+
+  if (g_reader.currentBookPath == path) {
+    g_reader.pageIndex = pageIndex;
+    resetSaveThrottle();
+    saveProgressThrottled(true);
+    if (g_reader.file) {
+      savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
+    }
+  }
+}
+
+static String bookViewerExtraStyle() {
+  return String("<style>") +
+    String(
+    ".bv-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px}"
+    ".bv-toolbar label{font-size:13px;color:var(--muted)}"
+    ".bv-reader{font-size:18px;line-height:1.55;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--pre-bg);max-height:70vh;overflow:auto;overflow-x:hidden;word-wrap:break-word;overflow-wrap:break-word}"
+    ".bv-sent{cursor:pointer;border-radius:4px;padding:0 1px}"
+    ".bv-sent:hover{background:var(--pill-bg)}"
+    ".bv-sent.sel{background:var(--link);color:#fff}"
+    ".bv-sent.find-hit{background:var(--warnbg);outline:1px solid var(--warn)}"
+    ".bv-sent.find-cur{outline:2px solid var(--link);background:var(--pill-bg)}"
+    ".bv-progressrow{display:flex;justify-content:flex-start;margin:0 0 12px}"
+    ".bv-jumpbar{position:fixed;left:0;right:0;bottom:0;padding:12px 16px;background:var(--card);border-top:1px solid var(--line);display:none;justify-content:center;gap:10px;flex-wrap:wrap;z-index:20;box-shadow:0 -4px 16px rgba(0,0,0,.08)}"
+    "html[data-theme=dark] .bv-jumpbar{box-shadow:0 -4px 16px rgba(0,0,0,.35)}"
+    ".bv-jumpbar.show{display:flex}"
+    "body:has(.bv-jumpbar.show) .wrap{padding-bottom:64px}"
+    ".bv-status{font-size:13px;color:var(--muted);min-height:1.2em;margin-top:8px}"
+    ".bv-findrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex:1;min-width:200px}"
+    ".bv-findrow input{flex:1;min-width:140px}"
+  ) + String("</style>");
+}
+
+static String bookViewerScript() {
+  return String(
+    "<script>"
+    "(function(){"
+    "var B=window.PALA_BOOK||{},root=document.getElementById('bvReader'),statusEl=document.getElementById('bvStatus'),"
+    "jumpBar=document.getElementById('bvJumpBar'),fontEl=document.getElementById('bvFont'),findEl=document.getElementById('bvFind'),"
+    "selOff=-1,selEl=null,fullText='',sentEls=[],findHits=[],findCur=-1;"
+    "function setStatus(t){if(statusEl)statusEl.textContent=t||'';}"
+    "function utf8ByteLen(ch){var c=ch.codePointAt(0);if(c<=0x7F)return 1;if(c<=0x7FF)return 2;if(c<=0xFFFF)return 3;return 4;}"
+    "function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}"
+    "function loadFont(){var v=18;try{v=parseInt(localStorage.getItem('palaBvFont')||'18',10)}catch(e){}"
+    "if(fontEl){fontEl.value=v;root.style.fontSize=v+'px';fontEl.oninput=function(){var n=parseInt(fontEl.value,10)||18;"
+    "root.style.fontSize=n+'px';try{localStorage.setItem('palaBvFont',String(n))}catch(e){}};}}"
+    "function splitSentences(text){var out=[],i=0,byteOff=0,n=text.length,pendingNl=0;"
+    "while(i<n){var nl=pendingNl;pendingNl=0;while(i<n&&/\\s/.test(text[i])){if(text[i]==='\\n')nl++;byteOff+=utf8ByteLen(text[i]);i++;}"
+    "if(i>=n)break;var start=i,startByte=byteOff;"
+    "while(i<n){var ch=text[i],end=false;"
+    "if(ch==='\\n'||ch==='\\r'){end=true;i++;byteOff+=utf8ByteLen(ch);pendingNl=1;break;}"
+    "if((ch==='.'||ch==='!'||ch==='?')&&(i+1>=n||/\\s/.test(text[i+1]))){i++;byteOff+=utf8ByteLen(ch);end=true;break;}"
+    "byteOff+=utf8ByteLen(ch);i++;}"
+    "var slice=text.slice(start,i);if(slice.trim().length)out.push({t:slice,off:startByte,nl:nl});"
+    "if(!end&&i>=n)break;}return out;}"
+    "function selectSentence(el){if(!el)return;if(selEl)selEl.classList.remove('sel');"
+    "selEl=el;selEl.classList.add('sel');selOff=parseInt(el.getAttribute('data-off')||'0',10);jumpBar.classList.add('show');}"
+    "function renderSentences(sents){var html='';for(var j=0;j<sents.length;j++){"
+    "if(j>0){if(sents[j].nl>0){for(var b=0;b<sents[j].nl;b++)html+='<br>';}else html+=' ';}"
+    "html+='<span class=\"bv-sent\" data-off=\"'+sents[j].off+'\">'+esc(sents[j].t)+'</span>';}"
+    "root.innerHTML=html;sentEls=root.querySelectorAll('.bv-sent');"
+    "for(var k=0;k<sentEls.length;k++){sentEls[k].onclick=function(ev){ev.stopPropagation();selectSentence(this);};}}"
+    "function clearFindMarks(){for(var i=0;i<sentEls.length;i++)sentEls[i].classList.remove('find-hit','find-cur');findHits=[];findCur=-1;}"
+    "function buildFindHits(){findHits=[];var q=(findEl&&findEl.value||'').trim();if(!q)return 0;"
+    "var ql=q.toLowerCase();for(var i=0;i<sentEls.length;i++){if(sentEls[i].textContent.toLowerCase().indexOf(ql)>=0)findHits.push(i);}"
+    "return findHits.length;}"
+    "function showFindMatch(){if(findCur<0||findCur>=findHits.length)return;"
+    "for(var i=0;i<sentEls.length;i++)sentEls[i].classList.remove('find-cur');"
+    "for(var h=0;h<findHits.length;h++)sentEls[findHits[h]].classList.add('find-hit');"
+    "var el=sentEls[findHits[findCur]];el.classList.add('find-cur');el.scrollIntoView({behavior:'smooth',block:'center'});"
+    "setStatus('Match '+(findCur+1)+' of '+findHits.length);}"
+    "function goFind(dir){var q=(findEl&&findEl.value||'').trim();if(!q){setStatus('Enter search text.');return;}"
+    "if(dir===0){clearFindMarks();if(!buildFindHits()){setStatus('No matches.');return;}findCur=0;}"
+    "else{if(!findHits.length){if(!buildFindHits()){setStatus('No matches. Press Find first.');return;}findCur=0;}"
+    "findCur+=dir;if(findCur>=findHits.length)findCur=0;if(findCur<0)findCur=findHits.length-1;}"
+    "showFindMatch();}"
+    "function sentenceAtOffset(off){if(!sentEls.length)return null;var best=null;"
+    "for(var i=0;i<sentEls.length;i++){var o=parseInt(sentEls[i].getAttribute('data-off')||'0',10);"
+    "if(o<=off)best=sentEls[i];else break;}return best;}"
+    "function scrollToByteOffset(off){var el=sentenceAtOffset(off);if(el)el.scrollIntoView({behavior:'smooth',block:'start'});}"
+    "document.getElementById('bvFindBtn').onclick=function(){goFind(0);};"
+    "document.getElementById('bvFindNextBtn').onclick=function(){goFind(1);};"
+    "document.getElementById('bvFindPrevBtn').onclick=function(){goFind(-1);};"
+    "if(findEl)findEl.onkeydown=function(e){if(e.key==='Enter')goFind(0);};"
+    "document.getElementById('bvMaxBtn').onclick=function(){"
+    "setStatus('Finding furthest progress...');"
+    "fetch('/readbook-max-progress?id='+B.id).then(function(r){return r.text();})"
+    ".then(function(t){var p=t.split('\\n');var off=parseInt(p[0],10)||0;var page=parseInt(p[1],10)||1;"
+    "var distinct=p[2]==='1';if(!distinct){setStatus('Furthest progress is your current place (page '+page+'). Read further on the device first.');return;}"
+    "var el=sentenceAtOffset(off);if(!el){setStatus('Could not find sentence at furthest progress.');return;}"
+    "selectSentence(el);el.scrollIntoView({behavior:'smooth',block:'center'});"
+    "setStatus('Selected furthest progress (page '+page+'). Tap Jump to save on device.');})"
+    ".catch(function(){setStatus('Could not load progress position.');});};"
+    "document.getElementById('bvJumpBtn').onclick=function(){"
+    "if(selOff<0){setStatus('Select a sentence first.');return;}"
+    "setStatus('Saving jump position...');"
+    "var body='id='+encodeURIComponent(B.id)+'&offset='+encodeURIComponent(selOff);"
+    "fetch('/jumpoffset',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
+    ".then(function(r){return r.text();})"
+    ".then(function(t){setStatus(t||'Jump saved for device.');jumpBar.classList.remove('show');"
+    "if(selEl){selEl.classList.remove('sel');selEl=null;}selOff=-1;})"
+    ".catch(function(){setStatus('Jump failed.');});};"
+    "document.body.onclick=function(){if(selEl){selEl.classList.remove('sel');selEl=null;selOff=-1;jumpBar.classList.remove('show');}};"
+    "jumpBar.onclick=function(e){e.stopPropagation();};"
+    "loadFont();setStatus('Loading book...');"
+    "fetch('/readbook-text?id='+B.id).then(function(r){if(!r.ok)throw new Error('load');return r.text();})"
+    ".then(function(txt){fullText=txt;var sents=splitSentences(txt);renderSentences(sents);"
+    "setStatus(sents.length+' sentences. Tap a sentence, then Jump to set the device page.');"
+    "return fetch('/readbook-page-offset?id='+B.id+'&page='+(B.savedPage||1));})"
+    ".then(function(r){return r.text();})"
+    ".then(function(t){scrollToByteOffset(parseInt(t,10)||0);})"
+    ".catch(function(){setStatus('Failed to load book text.');});"
+    "})();"
+    "</script>"
+  );
+}
+
 // ============================================================================
 //  Web handlers
 // ============================================================================
@@ -3428,7 +3776,7 @@ static void handleFiles() {
 
       out += "<form method='POST' action='/jumppage' class='stack small' accept-charset='UTF-8' style='margin-top:10px'>";
       out += "<input type='hidden' name='id' value='" + String(i) + "'>";
-      out += "<div class='row' style='align-items:end;gap:10px'><div style='flex:1'><input type='text' name='page' value='" + String(savedPage) + "' inputmode='numeric' placeholder='Page'></div><div><button type='submit'>Jump</button></div></div>";
+      out += "<div class='row' style='align-items:end;gap:10px'><div style='flex:1'><input type='text' name='page' value='" + String(savedPage) + "' inputmode='numeric' placeholder='Page'></div><div><button type='submit'>Jump</button></div><div><a class='btn secondary' href='/read?id=" + String(i) + "'>Find</a></div></div>";
       out += "<div class='muted'>Set the page that should open next on the device.<br><span class='muted'>The first open may take a moment.</span></div></form>";
 
       out += "<form method='POST' action='/move' class='stack small' accept-charset='UTF-8' style='margin-top:10px'>";
@@ -3648,6 +3996,13 @@ static void handleJumpPageWeb() {
   String path = String(g_library.books[id].path);
   String key = prefKeyForBook(path);
   prefs.putInt((key + "_p").c_str(), zeroBasedPage);
+  File jf = FS.open(path, "r");
+  if (jf) {
+    uint32_t off = pageOffsetForPage(jf, path, zeroBasedPage);
+    prefs.putUInt((key + "_o").c_str(), off);
+    updateMaxProgressForKey(key, zeroBasedPage, off);
+    jf.close();
+  }
 
   if (g_reader.currentBookPath == path) {
     g_reader.pageIndex = zeroBasedPage;
@@ -3661,6 +4016,168 @@ static void handleJumpPageWeb() {
 
   server.sendHeader("Location", "/files");
   server.send(302, "text/plain", "");
+}
+
+static void handleReadBookWeb() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  String bookName = String(g_library.books[id].name);
+  int savedPage = savedPageForBookPath(String(g_library.books[id].path)) + 1;
+  int maxPage = savedMaxPageForBookPath(String(g_library.books[id].path)) + 1;
+  if (savedPage < 1) savedPage = 1;
+  if (maxPage < 1) maxPage = 1;
+
+  String out = webPageStart(
+    "Find",
+    htmlEscape(bookName),
+    "<a href='/files'>&#8592; Files</a><a href='/'>Home</a>",
+    true
+  );
+  out += bookViewerExtraStyle();
+  out += "<div class='card'><h2>";
+  out += htmlEscape(bookName);
+  out += "</h2><p class='muted'>Comfortable reading on phone or PC. Change font size, search, tap a sentence and Jump to set where the device opens next.</p>";
+  out += "<div class='bv-toolbar'><label>Font size <input type='range' id='bvFont' min='14' max='28' value='18'></label>";
+  out += "<div class='bv-findrow'><input type='text' id='bvFind' placeholder='Find in book...'>";
+  out += "<button type='button' id='bvFindBtn' class='btn secondary'>Find</button>";
+  out += "<button type='button' id='bvFindNextBtn' class='btn secondary'>Find next</button>";
+  out += "<button type='button' id='bvFindPrevBtn' class='btn secondary'>Find previous</button></div>";
+  out += "</div>";
+  out += "<div class='bv-progressrow'><button type='button' id='bvMaxBtn' class='btn secondary'>Select furthest progress</button></div>";
+  out += "<div id='bvReader' class='bv-reader'></div>";
+  out += "<div id='bvStatus' class='bv-status'></div></div>";
+  out += "<div id='bvJumpBar' class='bv-jumpbar'><button type='button' id='bvJumpBtn' class='btn'>Jump</button></div>";
+  out += "<script>window.PALA_BOOK={id:";
+  out += String(id);
+  out += ",savedPage:";
+  out += String(savedPage);
+  out += ",maxPage:";
+  out += String(maxPage);
+  out += "};</script>";
+  out += bookViewerScript();
+  out += webPageEnd();
+  server.send(200, "text/html; charset=utf-8", out);
+}
+
+static void handleReadBookTextWeb() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  String path = String(g_library.books[id].path);
+  File f = FS.open(path, "r");
+  if (!f) {
+    server.send(500, "text/plain; charset=utf-8", "open failed");
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(f, "text/plain; charset=utf-8");
+  f.close();
+}
+
+static void handleReadBookMaxProgressWeb() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  String path = String(g_library.books[id].path);
+  int maxPage = 0;
+  uint32_t maxOffset = 0;
+  bool distinct = resolveMaxProgressForBook(path, maxPage, maxOffset);
+
+  String out = String(maxOffset);
+  out += "\n";
+  out += String(maxPage + 1);
+  out += "\n";
+  out += distinct ? "1" : "0";
+  server.send(200, "text/plain; charset=utf-8", out);
+}
+
+static void handleReadBookPageOffsetWeb() {
+  if (!server.hasArg("id") || !server.hasArg("page")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id/page");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  int page = server.arg("page").toInt();
+  if (page < 1) page = 1;
+  int zeroBasedPage = page - 1;
+
+  String path = String(g_library.books[id].path);
+  File f = FS.open(path, "r");
+  if (!f) {
+    server.send(500, "text/plain; charset=utf-8", "0");
+    return;
+  }
+
+  uint32_t off = pageOffsetForPage(f, path, zeroBasedPage);
+  f.close();
+  server.send(200, "text/plain; charset=utf-8", String(off));
+}
+
+static void handleJumpOffsetWeb() {
+  if (!server.hasArg("id") || !server.hasArg("offset")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id/offset");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  uint32_t offset = (uint32_t)server.arg("offset").toInt();
+  String path = String(g_library.books[id].path);
+  File f = FS.open(path, "r");
+  if (f) {
+    size_t sz = f.size();
+    if (sz > 0 && offset >= sz) offset = (uint32_t)(sz - 1);
+    f.close();
+  }
+
+  int pageIndex = pageIndexForByteOffset(path, offset);
+  setBookReadingPosition(path, pageIndex, offset);
+
+  String msg = "Jump saved. Device will open near page ";
+  msg += String(pageIndex + 1);
+  msg += " at this sentence.";
+  server.send(200, "text/plain; charset=utf-8", msg);
 }
 
 static void handleUploadDone() {
@@ -4129,51 +4646,54 @@ static String screensaverEditorHtml(bool multiScreensaver, bool hasFreeSlot) {
     ".ss-adv-body{margin-top:10px}"
     ".ss-label-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 0 6px}"
     ".ss-value{font-size:12px;color:var(--muted);white-space:nowrap}"
-    ".ss-preview-wrap{display:grid;gap:8px}"
+    ".ss-value-editable{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}"
+    ".ss-value-editable:hover{color:var(--link)}"
+    ".ss-value-input{width:4.8em;font-size:12px;padding:2px 5px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;text-align:right}"
+    ".ss-preview-wrap{display:flex;flex-direction:column;gap:8px;min-height:240px}"
+    ".ss-preview-stage{flex:1;display:flex;align-items:center;justify-content:center;min-height:140px}"
+    ".ss-preview-stage canvas{width:100%;max-width:520px;border:1px solid var(--line);border-radius:10px;background:#fff;image-rendering:pixelated;touch-action:none}"
+    ".ss-preview-wrap #ssResetBtn{align-self:flex-start;width:auto;padding:6px 12px;font-size:13px}"
     ".ss-meta{font-size:12px;color:var(--muted)}"
     ".ss-tip{font-size:12px;color:var(--muted)}"
     ".ss-status{font-size:13px;color:var(--muted)}"
-    ".ss-wrap input[type=range]{display:block;width:100%;max-width:420px}"
+    ".ss-wrap input[type=range]{display:block;width:100%;max-width:none;box-sizing:border-box}"
     "@media(max-width:560px){.ss-grid{grid-template-columns:1fr}}"
     "</style>";
 
   out +=
     "<div class='card'><h2>Screensaver editor</h2>"
-    "<p class='muted'>Edit on phone in browser and upload directly. Supports drag + pinch zoom. "
+    "<p class='muted'>Edit on phone in browser and upload directly. Supports drag, pinch, and scroll zoom. "
     "Output is always 250&times;122, 1-bit, 3904 bytes.</p>"
     "<div class='ss-wrap'>"
     "<div class='ss-card ss-grid'>"
     "<div class='full'><div class='ss-label-row'><label for='ssEditFile'>Source image</label></div><input id='ssEditFile' type='file' accept='image/*'></div>"
-    "<div><div class='ss-label-row'><label for='ssTolerance'>Black tolerance</label><span class='ss-value' id='ssToleranceLabel'>0%</span></div><input id='ssTolerance' type='range' min='-100' max='100' value='0'></div>"
+    "<div class='full'><div class='ss-label-row'><label for='ssTolerance'>Black tolerance</label><span class='ss-value ss-value-editable' id='ssToleranceLabel'>0%</span></div><input id='ssTolerance' type='range' min='-100' max='100' value='0'></div>"
     "<div class='full'><label style='display:flex;gap:10px;align-items:center;font-weight:500'><input id='ssInvert' type='checkbox'><span>Invert black/white</span></label></div>"
     "<div class='full'><details class='ss-adv'><summary>Precise Control</summary><div class='ss-adv-body ss-grid'>"
-    "<div><div class='ss-label-row'><label for='ssZoom'>Zoom</label><span class='ss-value' id='ssZoomLabel'>100%</span></div><input id='ssZoom' type='range' min='10' max='400' value='100'></div>"
-    "<div><div class='ss-label-row'><label for='ssPanX'>Move X</label><span class='ss-value' id='ssPanXLabel'>0 px</span></div><input id='ssPanX' type='range' min='-250' max='250' value='0'></div>"
-    "<div><div class='ss-label-row'><label for='ssPanY'>Move Y</label><span class='ss-value' id='ssPanYLabel'>0 px</span></div><input id='ssPanY' type='range' min='-180' max='180' value='0'></div>"
+    "<div><div class='ss-label-row'><label for='ssZoom'>Zoom</label><span class='ss-value ss-value-editable' id='ssZoomLabel'>100%</span></div><input id='ssZoom' type='range' min='10' max='400' value='100'></div>"
+    "<div><div class='ss-label-row'><label for='ssPanX'>Move X</label><span class='ss-value ss-value-editable' id='ssPanXLabel'>0 px</span></div><input id='ssPanX' type='range' min='-250' max='250' value='0'></div>"
+    "<div class='full'><div class='ss-label-row'><label for='ssPanY'>Move Y</label><span class='ss-value ss-value-editable' id='ssPanYLabel'>0 px</span></div><input id='ssPanY' type='range' min='-180' max='180' value='0'></div>"
     "</div></details></div>"
     "</div>"
     "<div class='ss-card ss-preview-wrap'>"
-    "<label>Preview (drag to move, pinch to zoom)</label>"
-    "<canvas id='ssPreview' width='250' height='122' style='width:100%;max-width:520px;border:1px solid var(--line);border-radius:10px;background:#fff;image-rendering:pixelated;touch-action:none'></canvas>"
+    "<label>Preview (drag to move, pinch or scroll to zoom)</label>"
+    "<div class='ss-preview-stage'><canvas id='ssPreview' width='250' height='122'></canvas></div>"
+    "<button type='button' class='btn secondary' id='ssResetBtn'>Reset fit</button>"
     "<div class='ss-meta' id='ssMeta'>No image loaded</div>"
     "</div>";
 
   if (multiScreensaver) {
     out +=
-      "<div class='ss-card ss-grid'>"
-      "<div><div class='ss-label-row'><label for='ssDestination'>Destination</label></div><select id='ssDestination'>"
+      "<div class='ss-card'>"
+      "<div class='ss-label-row'><label for='ssDestination'>Destination</label></div>"
+      "<select id='ssDestination'>"
       "<option value='slot' selected>Add to rotation slot (next free)</option>"
       "<option value='single'>Single screensaver (/sleep.bin)</option>"
-      "</select></div>"
-      "<div><div class='ss-label-row'><label>Rotation</label></div><div class='ss-tip'>";
-    if (hasFreeSlot) out += "Upload adds to the next free slot automatically.";
-    else out += "All 8 slots are full. Remove one from Screensaver files before adding.";
-    out += "</div></div></div>";
+      "</select></div>";
   }
 
   out +=
     "<div class='actions'>"
-    "<button type='button' id='ssResetBtn'>Reset fit</button>"
     "<button type='button' class='btn secondary' id='ssUploadBtn'>Upload edited image</button>"
     "<span class='ss-status' id='ssUploadStatus'></span>"
     "</div></div></div>";
@@ -4218,13 +4738,60 @@ static String screensaverEditorHtml(bool multiScreensaver, bool hasFreeSlot) {
       "var delta=Math.round(o*(255-128)/100);"
       "return clamp(128+delta,0,255);"
     "}"
-    "function setPanLabels(){panXLbl.textContent=panX.value+' px';panYLbl.textContent=panY.value+' px';}"
+    "var editingLbl=null;"
+    "function setLblText(lbl,text){if(lbl&&lbl!==editingLbl)lbl.textContent=text;}"
+    "function setPanLabels(){setLblText(panXLbl,panX.value+' px');setLblText(panYLbl,panY.value+' px');}"
     "function setControlLabels(){"
       "var tv=parseInt(tol.value,10)||0;"
-      "tolLbl.textContent=(tv>0?'+':'')+tv+'%';"
-      "zoomLbl.textContent=zoom.value+'%';"
+      "setLblText(tolLbl,(tv>0?'+':'')+tv+'%');"
+      "setLblText(zoomLbl,zoom.value+'%');"
       "setPanLabels();"
     "}"
+    "function bindValueEdit(lbl,slider){"
+      "if(!lbl||!slider)return;"
+      "lbl.title='Click to type a value';"
+      "function finishEdit(commit){"
+        "if(editingLbl!==lbl)return;"
+        "var inp=lbl.querySelector('input');"
+        "if(!inp)return;"
+        "if(commit){"
+          "var raw=String(inp.value).trim();"
+          "var n=parseInt(raw,10);"
+          "if(isNaN(n)&&raw.charAt(0)==='+')n=parseInt(raw.slice(1),10);"
+          "if(isNaN(n))n=parseInt(slider.value,10)||0;"
+          "n=clamp(n,parseInt(slider.min,10)||0,parseInt(slider.max,10)||0);"
+          "slider.value=String(n);"
+        "}"
+        "lbl.removeChild(inp);"
+        "editingLbl=null;"
+        "render();"
+      "}"
+      "function beginEdit(){"
+        "if(editingLbl||lbl.querySelector('input'))return;"
+        "editingLbl=lbl;"
+        "var inp=document.createElement('input');"
+        "inp.type='number';"
+        "inp.className='ss-value-input';"
+        "inp.min=slider.min;"
+        "inp.max=slider.max;"
+        "inp.step='1';"
+        "inp.value=String(parseInt(slider.value,10)||0);"
+        "lbl.textContent='';"
+        "lbl.appendChild(inp);"
+        "inp.focus();"
+        "if(inp.select)inp.select();"
+        "inp.addEventListener('keydown',function(e){"
+          "if(e.key==='Enter'){e.preventDefault();finishEdit(true);}"
+          "else if(e.key==='Escape'){e.preventDefault();finishEdit(false);}"
+        "});"
+        "inp.addEventListener('blur',function(){finishEdit(true);});"
+      "}"
+      "lbl.addEventListener('click',beginEdit);"
+    "}"
+    "bindValueEdit(tolLbl,tol);"
+    "bindValueEdit(zoomLbl,zoom);"
+    "bindValueEdit(panXLbl,panX);"
+    "bindValueEdit(panYLbl,panY);"
     "function fitImage(){"
       "if(!sourceImage)return;"
       "zoom.value='100';panX.value='0';panY.value='0';setControlLabels();render();"
@@ -4357,8 +4924,17 @@ static String screensaverEditorHtml(bool multiScreensaver, bool hasFreeSlot) {
     "}"
     "canvas.addEventListener('pointerup',endPointer);"
     "canvas.addEventListener('pointercancel',endPointer);"
+    "canvas.addEventListener('wheel',function(e){"
+      "if(!sourceImage)return;"
+      "e.preventDefault();"
+      "var z=parseInt(zoom.value,10)||100;"
+      "var step=Math.max(2,Math.round(Math.abs(e.deltaY)/25));"
+      "var next=z-(e.deltaY>0?step:-step);"
+      "zoom.value=String(clamp(next,10,400));"
+      "render();"
+    "},{passive:false});"
     "uploadBtn.addEventListener('click',function(){"
-      "if(!sourceImage){status.textContent='Choose an image first.';return;}"
+      "if(!sourceImage){alert('Please choose an image first.');return;}"
       "var img=render();"
       "if(!img){status.textContent='Preview is not ready yet.';return;}"
       "var bytes=packBytes(img);"
@@ -4376,7 +4952,9 @@ static String screensaverEditorHtml(bool multiScreensaver, bool hasFreeSlot) {
         "status.textContent='Upload complete. Refreshing...';"
         "setTimeout(function(){window.location.href='/settings';},600);"
       "}).catch(function(err){"
-        "status.textContent='Upload failed: '+(err&&err.message?err.message:'error');"
+        "var msg=err&&err.message?err.message:'error';"
+        "if(msg.indexOf('Please choose an image first.')>=0){alert(msg);status.textContent='';}"
+        "else{status.textContent='Upload failed: '+msg;}"
       "}).finally(function(){uploadBtn.disabled=false;});"
     "});"
     "setControlLabels();"
@@ -4445,13 +5023,13 @@ static void handleSettings() {
   out += "<option value='14'"; out += sel14; out += ">14px &mdash; large</option>";
   out +=
     "</select><div class='hint'>Controls how many lines fit on each page.</div>"
-    "<label for='readfont' style='display:block;margin-top:12px'>Reading font</label><select id='readfont' name='readfont'>"
-    "<option value='0'";
-  out += rfDefault;
-  out += ">Default</option><option value='1'";
-  out += rfOpenDys;
-  out += ">OpenDyslexia</option></select>"
-    "<div class='hint'>OpenDyslexia uses embedded OpenDyslexic bitmap glyphs built into firmware.</div></div>"
+    "<label for='lgap' style='display:block;margin-top:12px'>Line spacing</label><select id='lgap' name='lgap'>";
+  out += "<option value='0'"; out += lg0; out += ">0 px &mdash; compact</option>";
+  out += "<option value='1'"; out += lg1; out += ">1 px &mdash; normal</option>";
+  out += "<option value='2'"; out += lg2; out += ">2 px &mdash; relaxed</option>";
+  out += "<option value='3'"; out += lg3; out += ">3 px &mdash; loose</option>";
+  out +=
+    "</select><div class='hint'>A small change here can make text much easier to scan.</div></div>"
     "<div><label for='sleep'>Sleep after</label><select id='sleep' name='sleep'>"
     "<option value='30'"; out += ss30; out += ">30 seconds</option>";
   out += "<option value='60'"; out += ss60; out += ">1 minute</option>";
@@ -4460,13 +5038,13 @@ static void handleSettings() {
   out += "<option value='600'"; out += ss600; out += ">10 minutes</option>";
   out += "<option value='1800'"; out += ss1800; out += ">30 minutes</option>";
   out += "</select><div class='hint'>Auto-sleep keeps battery draw low while idle.</div></div>";
-  out += "<div><label for='lgap'>Line spacing</label><select id='lgap' name='lgap'>";
-  out += "<option value='0'"; out += lg0; out += ">0 px &mdash; compact</option>";
-  out += "<option value='1'"; out += lg1; out += ">1 px &mdash; normal</option>";
-  out += "<option value='2'"; out += lg2; out += ">2 px &mdash; relaxed</option>";
-  out += "<option value='3'"; out += lg3; out += ">3 px &mdash; loose</option>";
-  out +=
-    "</select><div class='hint'>A small change here can make text much easier to scan.</div></div>"
+  out += "<div><label for='readfont'>Reading font</label><select id='readfont' name='readfont'>"
+    "<option value='0'";
+  out += rfDefault;
+  out += ">Default</option><option value='1'";
+  out += rfOpenDys;
+  out += ">OpenDyslexia</option></select>"
+    "<div class='hint'>OpenDyslexia uses embedded OpenDyslexic bitmap glyphs built into firmware.</div></div>"
     "<div><label for='bionic'>Reading style</label><label style='display:flex;gap:10px;align-items:flex-start;font-weight:400;margin-top:10px'><input id='bionic' type='checkbox' name='bionic' value='1'";
   out += bionicChecked;
   out += "><span>Enable Bionic Reading (bold word starts for faster scanning).</span></label></div>"
@@ -4513,7 +5091,7 @@ static void handleSettings() {
 
     String slotDisabled = (nextSlot < 0) ? " disabled" : "";
     out += "<h2 style='margin-top:14px'>Add to rotation</h2>"
-      "<form method='POST' action='/upload-sleep-slot' enctype='multipart/form-data'>"
+      "<form method='POST' action='/upload-sleep-slot' enctype='multipart/form-data' onsubmit=\"var inp=this.elements['file'];if(!inp||!inp.files||!inp.files.length||!inp.files[0].size){alert('Please choose an image first.');return false;}return true;\">"
       "<div class='grid'><div><input type='file' name='file' accept='.bin,.BIN,application/octet-stream,*/*'";
     out += slotDisabled;
     out += "></div></div>"
@@ -4534,7 +5112,7 @@ static void handleSettings() {
       out += "<div class='status idle'>Using built-in screensaver.</div>";
     }
     out +=
-      "<form method='POST' action='/upload-sleep' enctype='multipart/form-data' style='margin-top:14px'>"
+      "<form method='POST' action='/upload-sleep' enctype='multipart/form-data' style='margin-top:14px' onsubmit=\"var inp=this.elements['file'];if(!inp||!inp.files||!inp.files.length||!inp.files[0].size){alert('Please choose an image first.');return false;}return true;\">"
       "<div class='grid'><div><label for='file'>Single custom image</label><input id='file' type='file' name='file' accept='.bin'></div></div>"
       "<div class='actions'><button type='submit'>Upload image</button></div>"
       "</form>"
@@ -4627,11 +5205,11 @@ static void handleSettingsPost() {
   }
 
   if (layoutChanged) {
-    invalidateAllPageCaches();
+    requestInvalidateAllPageCaches();
     if (mode == MODE_READER || mode == MODE_BM_PREVIEW) {
       g_bookmarkUi.previewActive = false; // exit preview on layout change
       mode = MODE_READER;
-      renderCurrentPage();
+      g_renderAfterLayoutInvalidate = true;
     }
   } else if (readerStyleChanged && (mode == MODE_READER || mode == MODE_BM_PREVIEW)) {
     g_bookmarkUi.previewActive = false;
@@ -4920,7 +5498,9 @@ static void handleUploadSleepStream() {
     if (g_upload.sleepSlotUpload) {
       if (sz != SLEEP_FRAME_BYTES) {
         if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-        g_upload.sleepError = "Rotation image must be exactly 3904 bytes";
+        g_upload.sleepError = (sz == 0)
+          ? "Please choose an image first."
+          : "Rotation image must be exactly 3904 bytes";
         g_upload.sleepOk = false;
       } else if (g_upload.sleepSlotTarget < 0 || g_upload.sleepSlotTarget >= MAX_MULTI_SLEEP_SLOTS) {
         if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
@@ -4942,7 +5522,9 @@ static void handleUploadSleepStream() {
     } else {
       if (sz < SLEEP_FRAME_BYTES || (sz % SLEEP_FRAME_BYTES) != 0) {
         if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-        g_upload.sleepError = "Sleep image must be 3904 bytes or a whole multiple (concatenated frames)";
+        g_upload.sleepError = (sz == 0)
+          ? "Please choose an image first."
+          : "Sleep image must be 3904 bytes or a whole multiple (concatenated frames)";
         g_upload.sleepOk = false;
       } else if ((int)(sz / SLEEP_FRAME_BYTES) > MAX_SLEEP_FRAMES) {
         if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
@@ -5082,6 +5664,11 @@ static void registerWebRoutes() {
   server.on("/mkdir", HTTP_POST, handleCreateFolder);
   server.on("/move", HTTP_POST, handleMoveBook);
   server.on("/jumppage", HTTP_POST, handleJumpPageWeb);
+  server.on("/read", HTTP_GET, handleReadBookWeb);
+  server.on("/readbook-text", HTTP_GET, handleReadBookTextWeb);
+  server.on("/readbook-page-offset", HTTP_GET, handleReadBookPageOffsetWeb);
+  server.on("/readbook-max-progress", HTTP_GET, handleReadBookMaxProgressWeb);
+  server.on("/jumpoffset", HTTP_POST, handleJumpOffsetWeb);
   server.on("/list", HTTP_GET, handleListWeb);
   server.on("/list", HTTP_POST, handleListSaveWeb);
   server.on("/list-clear-done", HTTP_POST, handleListClearDoneWeb);
@@ -5709,6 +6296,7 @@ static void idlePrefetchReader() {
 
 void loop() {
   btns.poll();
+  tickInvalidateAllPageCaches();
 
   if (g_isrDropCount > BTN_QUEUE_RECOVER_THRESHOLD) {
     noInterrupts();
