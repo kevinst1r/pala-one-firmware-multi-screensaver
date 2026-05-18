@@ -68,7 +68,7 @@ static void handleSettings() {
     "<p class='muted'>Tip: use <a class='link' href='https://javl.github.io/image2cpp/' target='_blank'>image2cpp</a> with <b>Plain bytes</b>. Invert colors if needed.</p>";
 
   if (hasSleepImg) {
-    out += "<div class='status ok'>&#10003; Custom screensaver active. <a class='link' href='/del-sleep' onclick=\"return confirm('Delete custom screensaver?')\">Delete</a></div>";
+    out += "<div class='status ok'>&#10003; Custom screensaver active. <form method='POST' action='/del-sleep' style='display:inline;margin-left:6px'><button type='submit' class='btn secondary' onclick=\"return confirm('Delete custom screensaver?')\">Delete</button></form></div>";
   } else {
     out += "<div class='status idle'>Using built-in screensaver.</div>";
   }
@@ -113,5 +113,5 @@ static void handleDeleteSleepImg() {
 void registerSettingsRoutes() {
   server.on("/settings",  HTTP_GET,  handleSettings);
   server.on("/settings",  HTTP_POST, handleSettingsPost);
-  server.on("/del-sleep", HTTP_GET,  handleDeleteSleepImg);
+  server.on("/del-sleep", HTTP_POST, handleDeleteSleepImg);
 }
