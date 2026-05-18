@@ -87,11 +87,9 @@ This is to stay compatible with Arduino IDE. The IDE recursively compiles files 
 
 ## Host-side tests
 
-Pure modules and KV-backed storage have host-side unit tests under `test/`. They build with CMake and run on your laptop — no board required:
+Pure modules and KV-backed storage have host-side unit tests under [`test/`](test/). They build with CMake and run on your laptop — no board required.
 
-```
-cmake -S test -B test/build && cmake --build test/build && ctest --test-dir test/build --output-on-failure
-```
+See [test/README.md](test/README.md) for prerequisites (CMake + a C++17 compiler) and per-platform setup / run instructions for Windows, Linux, and macOS.
 
 ## Apps
 
