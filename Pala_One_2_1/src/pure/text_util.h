@@ -38,4 +38,21 @@ String normalizeTypography(const String& in);
 // limit consecutive newlines to 2, strip trailing whitespace.
 String compactText(const String& in);
 
+// Streaming overload. Carries `lastWasSpace` and `newlineCount` across calls
+// so whitespace runs and newline runs that span chunk boundaries collapse
+// correctly. Pass `trimTail=false` on every chunk except the final one to
+// keep trailing whitespace from being chopped between chunks. State pointers
+// must be non-null; initialize *ioLastWasSpace to false and *ioNewlineCount
+// to 0 before the first call.
+//
+// Note: the in-chunk "strip trailing spaces before a newline" behavior does
+// NOT carry across a chunk boundary — a chunk ending in spaces followed by
+// a chunk starting with a newline will keep those spaces. PR #10 against
+// PaulLagier/main accepted this trade-off; the alternative (file-truncate
+// from the writer side) is not worth the complexity.
+String compactText(const String& in,
+                   bool* ioLastWasSpace,
+                   int* ioNewlineCount,
+                   bool trimTail);
+
 #endif  // PALA_PURE_TEXT_UTIL_H

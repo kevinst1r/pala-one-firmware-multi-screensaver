@@ -92,3 +92,45 @@ TEST_CASE("compactText trims trailing whitespace and newlines") {
 TEST_CASE("compactText drops trailing spaces before newline") {
   CHECK_EQ(compactText("a   \nb"), String("a\nb"));
 }
+
+TEST_CASE("compactText streaming: space run across chunk boundary collapses") {
+  bool lastWasSpace = false;
+  int newlineCount = 0;
+  String a = compactText("foo  ", &lastWasSpace, &newlineCount, /*trimTail=*/false);
+  String b = compactText("  bar", &lastWasSpace, &newlineCount, /*trimTail=*/true);
+  CHECK_EQ(a + b, String("foo bar"));
+}
+
+TEST_CASE("compactText streaming: newline run across chunk boundary collapses to two") {
+  bool lastWasSpace = false;
+  int newlineCount = 0;
+  String a = compactText("foo\n\n", &lastWasSpace, &newlineCount, /*trimTail=*/false);
+  String b = compactText("\n\nbar", &lastWasSpace, &newlineCount, /*trimTail=*/true);
+  CHECK_EQ(a + b, String("foo\n\nbar"));
+}
+
+TEST_CASE("compactText streaming: trimTail=false preserves trailing whitespace") {
+  bool lastWasSpace = false;
+  int newlineCount = 0;
+  String a = compactText("hello ", &lastWasSpace, &newlineCount, /*trimTail=*/false);
+  CHECK_EQ(a, String("hello "));
+  CHECK(lastWasSpace);
+}
+
+TEST_CASE("compactText streaming: final chunk with trimTail=true strips trailing") {
+  bool lastWasSpace = false;
+  int newlineCount = 0;
+  String a = compactText("hello", &lastWasSpace, &newlineCount, /*trimTail=*/false);
+  String b = compactText("   \n\n", &lastWasSpace, &newlineCount, /*trimTail=*/true);
+  CHECK_EQ(a + b, String("hello"));
+}
+
+TEST_CASE("compactText streaming: no word merging across boundary") {
+  // Chunk split mid-word: "fo"|"o bar" should still produce "foo bar"
+  // (no whitespace at the split point, so nothing to merge or collapse).
+  bool lastWasSpace = false;
+  int newlineCount = 0;
+  String a = compactText("fo", &lastWasSpace, &newlineCount, /*trimTail=*/false);
+  String b = compactText("o bar", &lastWasSpace, &newlineCount, /*trimTail=*/true);
+  CHECK_EQ(a + b, String("foo bar"));
+}

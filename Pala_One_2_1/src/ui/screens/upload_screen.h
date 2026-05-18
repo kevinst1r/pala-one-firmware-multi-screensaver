@@ -20,6 +20,11 @@ struct UploadState {
   String bookFinalName;
   bool bookOk = false;
   String bookError;
+  // Cross-chunk state for streaming compactText() during upload, so a
+  // whitespace or newline run that spans a chunk boundary collapses
+  // correctly. Reset in UPLOAD_FILE_START. See pure/text_util.h.
+  bool bookCompactLastWasSpace = false;
+  int  bookCompactNewlineCount = 0;
 
   String sleepTmpPath;
   bool sleepOk = false;

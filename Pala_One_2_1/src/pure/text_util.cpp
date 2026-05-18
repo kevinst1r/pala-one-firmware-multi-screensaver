@@ -96,12 +96,15 @@ String normalizeTypography(const String& in) {
   return out;
 }
 
-String compactText(const String& in) {
+String compactText(const String& in,
+                   bool* ioLastWasSpace,
+                   int* ioNewlineCount,
+                   bool trimTail) {
   String out;
   out.reserve(in.length());
 
-  bool lastWasSpace = false;
-  int newlineCount = 0;
+  bool lastWasSpace = ioLastWasSpace ? *ioLastWasSpace : false;
+  int newlineCount = ioNewlineCount ? *ioNewlineCount : 0;
   // Length of `out` up to (and including) its last non-space byte —
   // newlines count as non-space here. Lets newline emission strip
   // trailing spaces in O(1) without clobbering previously-emitted
@@ -140,11 +143,20 @@ String compactText(const String& in) {
     trimAnchor = out.length();
   }
 
-  while (out.length() > 0) {
-    char last = out[out.length() - 1];
-    if (last != ' ' && last != '\n') break;
-    out.remove(out.length() - 1);
+  if (ioLastWasSpace) *ioLastWasSpace = lastWasSpace;
+  if (ioNewlineCount) *ioNewlineCount = newlineCount;
+
+  if (trimTail) {
+    while (out.length() > 0) {
+      char last = out[out.length() - 1];
+      if (last != ' ' && last != '\n') break;
+      out.remove(out.length() - 1);
+    }
   }
 
   return out;
+}
+
+String compactText(const String& in) {
+  return compactText(in, nullptr, nullptr, /*trimTail=*/true);
 }
