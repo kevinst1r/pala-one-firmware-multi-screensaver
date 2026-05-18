@@ -32,7 +32,10 @@ AppHeaderStatus validateAppHeader(const void* buf, size_t fileSize,
 
   if (hdr.reloc_count > 0) {
     if (hdr.reloc_offset < sizeof(PalaAppHeader)) return AppHeaderStatus::BadRelocTable;
-    // Overflow-safe: reloc_count <= (fileSize - reloc_offset) / 4
+    // Bound reloc_offset against fileSize before the subtraction below, or
+    // (fileSize - reloc_offset) underflows when reloc_offset > fileSize and
+    // any reloc_count then passes the avail/4 check.
+    if (hdr.reloc_offset > fileSize) return AppHeaderStatus::BadRelocTable;
     uint32_t avail = (uint32_t)(fileSize - hdr.reloc_offset);
     if (hdr.reloc_count > avail / 4u) return AppHeaderStatus::BadRelocTable;
   }
@@ -51,13 +54,16 @@ bool validateRelocEntries(const void* buf, size_t fileSize) {
   for (uint32_t i = 0; i < hdr.reloc_count; i++) {
     uint32_t off;
     memcpy(&off, base + hdr.reloc_offset + i * 4u, sizeof(uint32_t));
-    // Each entry must point at a 4-byte slot strictly before the reloc
-    // table itself. (Entries inside the table would be self-referential.)
-    if (off + 4u > hdr.reloc_offset) return false;
-    // And the slot must be inside the file, which is implied by the above
-    // (reloc_offset <= fileSize), but we still guard against wraparound.
-    if (off + 4u < off) return false;
-    (void)fileSize;  // unused after the implicit guarantee above
+    // Each entry must target a 4-byte-aligned slot strictly after the
+    // header (the loader does *(uint32_t*)(buf+off) += base; targeting
+    // header bytes corrupts in-memory state the loader still relies on)
+    // and strictly before the reloc table itself (entries inside the
+    // table would be self-referential).
+    if (off + 4u < off)              return false;  // wraparound guard
+    if (off & 3u)                    return false;  // alignment
+    if (off < sizeof(PalaAppHeader)) return false;  // lower bound
+    if (off + 4u > hdr.reloc_offset) return false;  // upper bound
   }
+  (void)fileSize;  // reloc_offset is bounded by fileSize in validateAppHeader
   return true;
 }
