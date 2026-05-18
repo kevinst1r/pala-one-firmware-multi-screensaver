@@ -67,6 +67,8 @@ static void handleUploadBookStream() {
     UploadScreen::state().bookFinalName = "";
     UploadScreen::state().bookPendingUtf8Tail = "";
     UploadScreen::state().bookTmpPath = "";
+    UploadScreen::state().bookCompactLastWasSpace = false;
+    UploadScreen::state().bookCompactNewlineCount = 0;
 
     loadBooks();   // defensive — protects MAX_BOOKS check from a stale catalog
     if (g_library.bookCount >= MAX_BOOKS) {
@@ -105,8 +107,22 @@ static void handleUploadBookStream() {
       }
       if (chunk.length() > 0) {
         String cleaned = normalizeTypography(chunk);
-        cleaned = compactText(cleaned);
-        UploadScreen::state().bookTmpFile.print(cleaned);
+        cleaned = compactText(cleaned,
+                              &UploadScreen::state().bookCompactLastWasSpace,
+                              &UploadScreen::state().bookCompactNewlineCount,
+                              /*trimTail=*/false);
+        size_t cleanedLen = cleaned.length();
+        size_t wrote = UploadScreen::state().bookTmpFile.print(cleaned);
+        if (wrote != cleanedLen) {
+          // Short write — out of space or FS error. Abort so a truncated
+          // file isn't promoted to a finalized book.
+          UploadScreen::state().bookError = "Write failed (out of space?)";
+          UploadScreen::state().bookTmpFile.close();
+          if (UploadScreen::state().bookTmpPath.length() > 0
+              && FS.exists(UploadScreen::state().bookTmpPath)) {
+            FS.remove(UploadScreen::state().bookTmpPath);
+          }
+        }
       }
     }
   }
@@ -115,13 +131,27 @@ static void handleUploadBookStream() {
     if (UploadScreen::state().bookTmpFile) {
       if (UploadScreen::state().bookPendingUtf8Tail.length() > 0) {
         String cleaned = normalizeTypography(UploadScreen::state().bookPendingUtf8Tail);
-        cleaned = compactText(cleaned);
-        UploadScreen::state().bookTmpFile.print(cleaned);
+        cleaned = compactText(cleaned,
+                              &UploadScreen::state().bookCompactLastWasSpace,
+                              &UploadScreen::state().bookCompactNewlineCount,
+                              /*trimTail=*/true);
+        size_t cleanedLen = cleaned.length();
+        size_t wrote = UploadScreen::state().bookTmpFile.print(cleaned);
+        if (wrote != cleanedLen && UploadScreen::state().bookError.length() == 0) {
+          UploadScreen::state().bookError = "Write failed (out of space?)";
+        }
         UploadScreen::state().bookPendingUtf8Tail = "";
       }
       UploadScreen::state().bookTmpFile.close();
 
-      if (UploadScreen::state().bookTmpPath.length() > 0 && up.totalSize > 0) {
+      if (UploadScreen::state().bookError.length() > 0) {
+        // Short write or earlier error — never promote a truncated tmp file
+        // to a finalized book.
+        if (UploadScreen::state().bookTmpPath.length() > 0
+            && FS.exists(UploadScreen::state().bookTmpPath)) {
+          FS.remove(UploadScreen::state().bookTmpPath);
+        }
+      } else if (UploadScreen::state().bookTmpPath.length() > 0 && up.totalSize > 0) {
         String finalPath = UploadScreen::state().bookTmpPath.substring(0, UploadScreen::state().bookTmpPath.length() - 4);
         if (FS.exists(finalPath)) FS.remove(finalPath);
         if (FS.rename(UploadScreen::state().bookTmpPath, finalPath)) {
