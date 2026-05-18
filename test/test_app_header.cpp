@@ -114,6 +114,18 @@ TEST_CASE("validateAppHeader: reloc_offset inside header is rejected") {
         == AppHeaderStatus::BadRelocTable);
 }
 
+TEST_CASE("validateAppHeader: reloc_offset past fileSize is rejected") {
+  // (fileSize - reloc_offset) used to underflow when reloc_offset > fileSize,
+  // letting any reloc_count slip through the avail/4 check.
+  size_t totalSz = sizeof(PalaAppHeader) + 4;
+  auto bin = makeBin(PALA_APP_MAGIC, PALA_API_VERSION,
+                     sizeof(PalaAppHeader),
+                     /*relocOff*/ (uint32_t)(totalSz + 100),
+                     /*count*/ 1, totalSz);
+  CHECK(validateAppHeader(bin.data(), bin.size())
+        == AppHeaderStatus::BadRelocTable);
+}
+
 TEST_CASE("validateRelocEntries: empty reloc table is trivially ok") {
   auto bin = makeValid();
   CHECK(validateRelocEntries(bin.data(), bin.size()) == true);
@@ -142,6 +154,35 @@ TEST_CASE("validateRelocEntries: entry pointing into reloc table is rejected") {
   // Self-referential: points to the start of the reloc table itself.
   uint32_t selfRef = relocOff;
   std::memcpy(bin.data() + relocOff, &selfRef, sizeof(selfRef));
+
+  REQUIRE(validateAppHeader(bin.data(), bin.size()) == AppHeaderStatus::Ok);
+  CHECK(validateRelocEntries(bin.data(), bin.size()) == false);
+}
+
+TEST_CASE("validateRelocEntries: entry pointing into header is rejected") {
+  // The loader does *(uint32_t*)(buf+off) += base; an entry pointing inside
+  // the header would corrupt in-memory header state.
+  size_t totalSz = sizeof(PalaAppHeader) + 16;
+  uint32_t relocOff = sizeof(PalaAppHeader) + 4;
+  auto bin = makeBin(PALA_APP_MAGIC, PALA_API_VERSION,
+                     sizeof(PalaAppHeader),
+                     relocOff, /*count*/ 1, totalSz);
+  uint32_t insideHeader = 0;  // start of magic field
+  std::memcpy(bin.data() + relocOff, &insideHeader, sizeof(insideHeader));
+
+  REQUIRE(validateAppHeader(bin.data(), bin.size()) == AppHeaderStatus::Ok);
+  CHECK(validateRelocEntries(bin.data(), bin.size()) == false);
+}
+
+TEST_CASE("validateRelocEntries: unaligned entry offset is rejected") {
+  // Loader writes *(uint32_t*)(buf+off); off must be 4-byte aligned.
+  size_t totalSz = sizeof(PalaAppHeader) + 16;
+  uint32_t relocOff = sizeof(PalaAppHeader) + 4;
+  auto bin = makeBin(PALA_APP_MAGIC, PALA_API_VERSION,
+                     sizeof(PalaAppHeader),
+                     relocOff, /*count*/ 1, totalSz);
+  uint32_t unaligned = (uint32_t)sizeof(PalaAppHeader) + 1;
+  std::memcpy(bin.data() + relocOff, &unaligned, sizeof(unaligned));
 
   REQUIRE(validateAppHeader(bin.data(), bin.size()) == AppHeaderStatus::Ok);
   CHECK(validateRelocEntries(bin.data(), bin.size()) == false);
