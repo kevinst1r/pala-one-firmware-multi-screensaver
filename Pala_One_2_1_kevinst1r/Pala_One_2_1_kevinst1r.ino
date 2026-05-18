@@ -422,6 +422,7 @@ static void resetPreviewState();
 static void resetUiEphemeralState();
 static void resetNavigationState();
 static void syncWakeState(bool reading);
+static void saveProgressThrottled(bool force = false);
 static void enterLibraryRoot(bool redraw = true);
 
 static uint32_t hashPath32(const String& path);
@@ -434,6 +435,7 @@ static bool loadPageOffsetCacheForBook(const String& path, size_t expectedSize);
 static void savePageOffsetCacheForBook(const String& path, size_t fileSize);
 static void requestInvalidateAllPageCaches();
 static bool tickInvalidateAllPageCaches();
+static uint32_t readerTopByteOffset();
 static void relocateOpenBookToOffset(uint32_t targetOffset);
 static uint32_t resolveBookmarkOffset(const String& path, uint16_t page, uint32_t storedOffset);
 static String readPageTextForWeb(const String& path, int page);
@@ -706,6 +708,9 @@ static void syncWakeState(bool reading) {
 }
 
 static void enterLibraryRoot(bool redraw) {
+  if (mode == MODE_READER && g_reader.currentBookKey.length() > 0) {
+    saveProgressThrottled(true);
+  }
   safeCloseCurrentBook();
   resetPreviewState();
   resetNavigationState();
@@ -1137,13 +1142,11 @@ static void finishLayoutInvalidateOpenBook() {
     g_reader.eofReached = false;
     resetSaveThrottle();
     if (g_layoutInv.haveOpenBookOffset && g_reader.file) {
-      relocateOpenBookToOffset(g_layoutInv.openBookOffset);
+      uint32_t anchor = g_layoutInv.openBookOffset;
+      relocateOpenBookToOffset(anchor);
       if (g_reader.currentBookKey.length() > 0) {
         prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
-        if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-          prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                        g_reader.pageOffsets[g_reader.pageIndex]);
-        }
+        prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), anchor);
         prefs.remove((g_reader.currentBookKey + "_n").c_str());
       }
     }
@@ -1177,9 +1180,9 @@ static bool tickInvalidateAllPageCaches() {
     g_layoutInv.openBookOffset = 0;
     g_layoutInv.haveOpenBookOffset = false;
     if (g_reader.currentBookKey.length() > 0
-        && g_reader.pageIndex >= 0
-        && g_reader.pageIndex < g_reader.knownPages) {
-      g_layoutInv.openBookOffset = g_reader.pageOffsets[g_reader.pageIndex];
+        && g_reader.currentBookPath.length() > 0
+        && (mode == MODE_READER || mode == MODE_BM_PREVIEW)) {
+      g_layoutInv.openBookOffset = readerTopByteOffset();
       g_layoutInv.haveOpenBookOffset = true;
       prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), g_layoutInv.openBookOffset);
     }
@@ -1822,7 +1825,7 @@ static inline void resetSaveThrottle() {
   g_reader.lastSavedPage = -1;
 }
 
-static void saveProgressThrottled(bool force = false) {
+static void saveProgressThrottled(bool force) {
   if (g_reader.currentBookKey.length() == 0) return;
 
   if (!force) {
@@ -1832,11 +1835,14 @@ static void saveProgressThrottled(bool force = false) {
   }
 
   prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
-  // Persist the byte offset of the current page so font / line-gap changes can
-  // re-locate the reader at the same text position in the new layout.
+  // Persist the top-of-screen byte offset so font / spacing / bionic changes can
+  // re-locate the reader at the same line in the new layout.
+  uint32_t curOff = readerTopByteOffset();
+  prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), curOff);
+  if (g_reader.currentBookPath.length() > 0) {
+    prefs.putString("last_book_path", g_reader.currentBookPath);
+  }
   if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-    uint32_t curOff = g_reader.pageOffsets[g_reader.pageIndex];
-    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), curOff);
     updateMaxProgressForKey(g_reader.currentBookKey, g_reader.pageIndex, curOff);
   }
   g_reader.lastSaveMs = millis();
@@ -2525,28 +2531,96 @@ static void ensureOffsetsUpTo(int targetPage) {
   }
 }
 
-// Locate the page containing `targetOffset` in the current font layout, then
-// position pageIndex one page earlier than that containing page (a small
-// re-read so the user never skips past their last position). Walks pages
-// forward via ensureOffsetsUpTo(); falls back to the last known page on
-// EOF / MAX_PAGES cap. Pagination of a multi-MB book can take many seconds,
-// so we yield periodically to keep the task watchdog and HTTP server happy.
+// Byte offset of the first visible line on the current reader screen.
+static uint32_t readerTopByteOffset() {
+  if (g_reader.lastPageStartOffset > 0) return g_reader.lastPageStartOffset;
+  if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
+    return g_reader.pageOffsets[g_reader.pageIndex];
+  }
+  return 0;
+}
+
+// Truncate the offset table after `page` and force that page to start at `startOffset`.
+static void setPageStartAndTruncateAfter(int page, uint32_t startOffset) {
+  g_reader.pageOffsets[page] = startOffset;
+  g_reader.knownPages = page + 1;
+  g_reader.eofReached = false;
+}
+
+// Locate the page that should display text starting at `targetOffset` in the
+// current layout. When the natural page break falls before targetOffset, force
+// that page to start at targetOffset so the top line stays the same after a
+// font / spacing / bionic change. Walks pages forward via ensureOffsetsUpTo();
+// falls back to the last known page on EOF / MAX_PAGES cap.
 static void relocateOpenBookToOffset(uint32_t targetOffset) {
+  resetOffsetCache();
+  g_reader.knownPages = 1;
+  g_reader.pageOffsets[0] = 0;
+  g_reader.eofReached = false;
+
   if (targetOffset == 0) {
     g_reader.pageIndex = 0;
     return;
   }
 
-  for (int k = 1; k < MAX_PAGES; k++) {
+  for (int k = 0; k < MAX_PAGES; k++) {
     ensureOffsetsUpTo(k);
     if ((k & 0x3F) == 0) yield();  // every 64 pages: feed WDT + service HTTP
-    if (g_reader.eofReached && (int)g_reader.knownPages <= k) break;
-    if (g_reader.pageOffsets[k] > targetOffset) {
-      int containing = k - 1;                                  // page that contains targetOffset
-      g_reader.pageIndex = (containing > 0) ? (containing - 1) : 0;  // one earlier, for re-read
+
+    uint32_t start = g_reader.pageOffsets[k];
+    if (start == targetOffset) {
+      g_reader.pageIndex = k;
+      return;
+    }
+
+    if (start > targetOffset) {
+      if (k > 0) {
+        k--;
+        start = g_reader.pageOffsets[k];
+      }
+      g_reader.pageIndex = k;
+      if (start < targetOffset) {
+        setPageStartAndTruncateAfter(k, targetOffset);
+        uint32_t next = buildNextOffset(targetOffset);
+        if (next > targetOffset && g_reader.knownPages < MAX_PAGES) {
+          g_reader.pageOffsets[g_reader.knownPages] = next;
+          g_reader.knownPages++;
+        } else if (next <= targetOffset) {
+          g_reader.eofReached = true;
+        }
+      }
+      return;
+    }
+
+    if (g_reader.eofReached && (int)g_reader.knownPages <= k + 1) {
+      g_reader.pageIndex = k;
+      if (start < targetOffset) {
+        setPageStartAndTruncateAfter(k, targetOffset);
+        uint32_t next = buildNextOffset(targetOffset);
+        if (next > targetOffset && g_reader.knownPages < MAX_PAGES) {
+          g_reader.pageOffsets[g_reader.knownPages] = next;
+          g_reader.knownPages++;
+        }
+      }
+      return;
+    }
+
+    ensureOffsetsUpTo(k + 1);
+    if ((int)g_reader.knownPages > k + 1
+        && g_reader.pageOffsets[k + 1] > targetOffset) {
+      g_reader.pageIndex = k;
+      if (start < targetOffset) {
+        setPageStartAndTruncateAfter(k, targetOffset);
+        uint32_t next = buildNextOffset(targetOffset);
+        if (next > targetOffset && g_reader.knownPages < MAX_PAGES) {
+          g_reader.pageOffsets[g_reader.knownPages] = next;
+          g_reader.knownPages++;
+        }
+      }
       return;
     }
   }
+
   g_reader.pageIndex = (g_reader.knownPages > 0) ? (int)g_reader.knownPages - 1 : 0;
 }
 
@@ -2570,19 +2644,37 @@ static bool openBookByIndex(int idx) {
   g_reader.knownPages = 1;
   g_reader.pageOffsets[0] = 0;
   g_reader.eofReached = false;
-  loadPageOffsetCacheForBook(path, g_reader.file.size());
-  // If the layout changed since this book was last open ("_n" set by
-  // invalidateAllPageCaches), re-derive the page from the saved byte offset
-  // instead of trusting the now-stale "_p" page number.
-  if (prefs.getBool((g_reader.currentBookKey + "_n").c_str(), false)) {
+
+  bool needsRelayout = prefs.getBool((g_reader.currentBookKey + "_n").c_str(), false);
+  // Stale /pc_*.bin caches are from the old font layout — never load them when
+  // re-deriving position after a settings change.
+  if (!needsRelayout) {
+    loadPageOffsetCacheForBook(path, g_reader.file.size());
+  } else {
+    FS.remove(pageCachePathForBook(path));
+    resetOffsetCache();
+  }
+
+  if (needsRelayout) {
     uint32_t target = prefs.getUInt((g_reader.currentBookKey + "_o").c_str(), 0);
-    relocateOpenBookToOffset(target);
+    if (target > 0) {
+      relocateOpenBookToOffset(target);
+    } else {
+      int oldPage = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
+      if (oldPage < 0) oldPage = 0;
+      ensureOffsetsUpTo(oldPage);
+      g_reader.pageIndex = oldPage;
+      if (g_reader.pageIndex >= g_reader.knownPages) {
+        g_reader.pageIndex = g_reader.knownPages > 0 ? g_reader.knownPages - 1 : 0;
+      }
+    }
     prefs.remove((g_reader.currentBookKey + "_n").c_str());
     prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
+    uint32_t anchor = 0;
     if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-      prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                    g_reader.pageOffsets[g_reader.pageIndex]);
+      anchor = g_reader.pageOffsets[g_reader.pageIndex];
     }
+    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), anchor);
   } else {
     g_reader.pageIndex = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
     if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
@@ -5135,7 +5227,6 @@ static void handleSettings() {
 
 static void handleSettingsPost() {
   bool layoutChanged = false;
-  bool readerStyleChanged = false;
 
   if (server.hasArg("font") || server.hasArg("readfont")) {
     int fs = g_settings.fontSize;
@@ -5185,7 +5276,7 @@ static void handleSettingsPost() {
     if (bionicEnabled != g_settings.bionicReading) {
       g_settings.bionicReading = bionicEnabled;
       prefs.putInt("cfg_bionic", bionicEnabled ? 1 : 0);
-      readerStyleChanged = true;
+      layoutChanged = true;
     }
   }
 
@@ -5205,16 +5296,18 @@ static void handleSettingsPost() {
   }
 
   if (layoutChanged) {
+    if ((mode == MODE_READER || mode == MODE_BM_PREVIEW)
+        && g_reader.currentBookKey.length() > 0) {
+      uint32_t topOff = readerTopByteOffset();
+      prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), topOff);
+      saveProgressThrottled(true);
+    }
     requestInvalidateAllPageCaches();
     if (mode == MODE_READER || mode == MODE_BM_PREVIEW) {
       g_bookmarkUi.previewActive = false; // exit preview on layout change
       mode = MODE_READER;
       g_renderAfterLayoutInvalidate = true;
     }
-  } else if (readerStyleChanged && (mode == MODE_READER || mode == MODE_BM_PREVIEW)) {
-    g_bookmarkUi.previewActive = false;
-    mode = MODE_READER;
-    renderCurrentPage();
   }
 
   server.sendHeader("Location", "/settings");
@@ -5695,6 +5788,9 @@ static void registerWebRoutes() {
 }
 
 static void startUploadMode() {
+  if (mode == MODE_READER && g_reader.currentBookKey.length() > 0) {
+    saveProgressThrottled(true);
+  }
   mode = MODE_UPLOAD;
   g_upload.startedMs = millis();
 

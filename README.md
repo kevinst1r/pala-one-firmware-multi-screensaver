@@ -121,7 +121,7 @@ This fork includes multiple firmware and WebUI improvements for the Heltec V1.2 
 - Bionic Reading toggle in settings (bold word starts for faster scanning)
 - Reading font dropdown with `Default` and `OpenDyslexia` options (see below)
 - Dark mode toggle in WebUI
-- Reading-location retention on layout changes so font/font-size/line-spacing updates keep the user near the same sentence instead of jumping to page 1* (*Haven't re-added yet.  Need to test new firmware version first)
+- **Reading-location retention** on layout changes — changing font, font size, line spacing, or Bionic Reading keeps the **first visible line** on screen at the same place in the book (see below)
 - Single and multi screensaver modes in the WebUI Settings page
 - Mode-specific UI (single mode and multi mode are shown separately)
 - Multi-screensaver rotation list with per-image thumbnail previews
@@ -132,6 +132,20 @@ This fork includes multiple firmware and WebUI improvements for the Heltec V1.2 
 - Screensaver thumbnails are generated on-device using the same bitmap pipeline as displayed images
 - Built-in WebUI screensaver editor (phone/browser-side processing, no on-device image conversion)
 - **Find** web book viewer on the Files page (read and search books in the browser)
+
+### Reading-location retention
+
+When you change reader layout settings (font family, font size, line spacing, or Bionic Reading) from the WebUI **Settings** page, the firmware saves the **byte offset of the top line** currently on the e-ink screen (`_o` in NVS) and marks the book for re-pagination (`_n`).
+
+After a layout change:
+
+- Stale on-device page caches (`/pc_*.bin`) are deleted; pagination is rebuilt for the new font metrics.
+- On the next open, the reader relocates to the saved byte offset instead of using the old page number (`_p`), which would be wrong after reflow.
+- If the new layout’s natural page break falls slightly before your saved position, the firmware can **force the page to start at that offset** so the same opening line stays visible.
+
+**Saving your place before settings:** Leaving the reader (triple-click to library) or going to sleep saves the current top-of-screen offset. Change settings in upload mode, then reopen the book from the library — you should land on the same text, not page 1 or a random jump.
+
+This uses the same `_o` / `_n` mechanism as **Find → Jump** on the web viewer, so sentence jumps and layout changes stay consistent.
 
 ### Find (web book viewer)
 
@@ -172,7 +186,7 @@ The page title is **Find**. The book name appears as the subtitle.
 2. Tap **Jump** in the bar that appears at the bottom of the screen.
 3. The device will open that book near the page containing that sentence the next time you read it on e-ink.
 
-This saves both page index and byte offset in NVS, so layout changes (font size, line gap) can still relocate you correctly.
+This saves both page index and byte offset in NVS, so layout changes (font, font size, line spacing, Bionic Reading) can still relocate you correctly.
 
 #### Related WebUI routes
 
