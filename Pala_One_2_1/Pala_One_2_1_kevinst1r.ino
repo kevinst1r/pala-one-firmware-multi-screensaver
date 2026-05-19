@@ -6,7 +6,7 @@
 
 // ── Board selection: uncomment the line that matches your hardware ────────────
 // #define BOARD_V1_1
-// #define BOARD_V1_2
+#define BOARD_V1_2
 // ─────────────────────────────────────────────────────────────────────────────
 #ifdef BOARD_V1_1
   using DisplayType = EInkDisplay_WirelessPaperV1_1;
@@ -33,6 +33,7 @@ DisplayType display;
 
 #include <Adafruit_GFX.h>
 #include <U8g2_for_Adafruit_GFX.h>
+#include "opendyslexic_u8g2_fonts.h"
 U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 #include <esp_timer.h>
@@ -50,6 +51,11 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 static const int SCREEN_W = 250;
 static const int SCREEN_H = 122;
+
+// Custom sleep / screensaver: one or more raw XBM frames concatenated (3904 bytes each).
+static const size_t SLEEP_FRAME_BYTES = 3904;
+static const int MAX_SLEEP_FRAMES = 16;
+static const int MAX_MULTI_SLEEP_SLOTS = 8;
 
 static const uint8_t MAX_BOOKMARKS = 12;
 static const int MAX_BOOKS = 80;
@@ -88,6 +94,9 @@ static const bool ENABLE_DEEP_SLEEP = true;
 static const uint8_t* PAGE_FONT = u8g2_font_5x8_tf;
 const uint8_t* MAIN_FONT = u8g2_font_helvR08_te;
 const uint8_t* BOLD_FONT = u8g2_font_helvB08_te;
+
+// Extra horizontal advance after the bold bionic prefix (not a space glyph) so the regular suffix reads evenly.
+static const int BIONIC_STRONG_REST_GAP_PX = 1;
 
 #define BTN 0
 #define HAS_BATTERY 1
@@ -143,8 +152,11 @@ struct LayoutMetrics {
 
 struct RuntimeSettings {
   int fontSize = 8;
+  // 0 = Helvetica (default), 1 = OpenDyslexic (embedded u8g2 bitmap font set).
+  int readingFont = 0;
   uint32_t sleepSecs = 120;
   int lineGap = 0;
+  bool bionicReading = false;
   int readerLongPressAction = LONGPRESS_BOOKMARK;
 };
 
@@ -243,6 +255,8 @@ struct UploadState {
   String sleepTmpPath;
   bool sleepOk = false;
   String sleepError;
+  int sleepSlotTarget = -1;
+  bool sleepSlotUpload = false;
 
   String appTmpPath;
   String appFinalName;
@@ -347,6 +361,20 @@ static const char* AP_PASS = "palaread";
 
 static const uint8_t BTN_Q = 64;
 static const uint32_t BTN_QUEUE_RECOVER_THRESHOLD = 10;
+static const int LAYOUT_INV_FS_FILES_PER_TICK = 3;
+static const int LAYOUT_INV_BOOKS_PER_TICK = 4;
+
+struct LayoutInvalidateState {
+  bool active = false;
+  uint8_t phase = 0;  // 0=setup, 1=fs scan, 2=mark books, 3=open book, 4=done
+  File root;
+  int bookIdx = 0;
+  uint32_t openBookOffset = 0;
+  bool haveOpenBookOffset = false;
+};
+static LayoutInvalidateState g_layoutInv;
+static bool g_renderAfterLayoutInvalidate = false;
+
 volatile uint8_t btnQHead = 0;
 volatile uint8_t btnQTail = 0;
 volatile bool btnQState[BTN_Q];
@@ -379,7 +407,7 @@ HeltecGFXAdapter gfx(display);
 // ============================================================================
 static void invalidateMetrics();
 static const LayoutMetrics& getMetrics();
-static void applyFontSize(int sz);
+static void applyReaderFonts(int sz);
 static void loadSettings();
 static void markUserActivity();
 static void clearButtonQueue();
@@ -394,6 +422,7 @@ static void resetPreviewState();
 static void resetUiEphemeralState();
 static void resetNavigationState();
 static void syncWakeState(bool reading);
+static void saveProgressThrottled(bool force = false);
 static void enterLibraryRoot(bool redraw = true);
 
 static uint32_t hashPath32(const String& path);
@@ -404,7 +433,9 @@ static void idlePrefetchReader();
 static String pageCachePathForBook(const String& path);
 static bool loadPageOffsetCacheForBook(const String& path, size_t expectedSize);
 static void savePageOffsetCacheForBook(const String& path, size_t fileSize);
-static void invalidateAllPageCaches();
+static void requestInvalidateAllPageCaches();
+static bool tickInvalidateAllPageCaches();
+static uint32_t readerTopByteOffset();
 static void relocateOpenBookToOffset(uint32_t targetOffset);
 static uint32_t resolveBookmarkOffset(const String& path, uint16_t page, uint32_t storedOffset);
 static String readPageTextForWeb(const String& path, int page);
@@ -467,20 +498,34 @@ static const LayoutMetrics& getMetrics() {
   return g_metrics;
 }
 
-static void applyFontSize(int sz) {
-  switch (sz) {
-    case 8:  MAIN_FONT = u8g2_font_helvR08_te; BOLD_FONT = u8g2_font_helvB08_te; break;
-    case 10: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; break;
-    case 12: MAIN_FONT = u8g2_font_helvR12_te; BOLD_FONT = u8g2_font_helvB12_te; break;
-    case 14: MAIN_FONT = u8g2_font_helvR14_te; BOLD_FONT = u8g2_font_helvB14_te; break;
-    default: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; sz = 10; break;
-  }
+static void applyReaderFonts(int sz) {
+  if (sz != 8 && sz != 10 && sz != 12 && sz != 14) sz = 10;
   g_settings.fontSize = sz;
+
+  if (g_settings.readingFont == 1) {
+    switch (sz) {
+      case 8:  MAIN_FONT = u8g2_font_open_dys_r08_te; BOLD_FONT = u8g2_font_open_dys_b08_te; break;
+      case 10: MAIN_FONT = u8g2_font_open_dys_r10_te; BOLD_FONT = u8g2_font_open_dys_b10_te; break;
+      case 12: MAIN_FONT = u8g2_font_open_dys_r12_te; BOLD_FONT = u8g2_font_open_dys_b12_te; break;
+      case 14: MAIN_FONT = u8g2_font_open_dys_r14_te; BOLD_FONT = u8g2_font_open_dys_b14_te; break;
+      default: MAIN_FONT = u8g2_font_open_dys_r10_te; BOLD_FONT = u8g2_font_open_dys_b10_te; break;
+    }
+  } else {
+    switch (sz) {
+      case 8:  MAIN_FONT = u8g2_font_helvR08_te; BOLD_FONT = u8g2_font_helvB08_te; break;
+      case 10: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; break;
+      case 12: MAIN_FONT = u8g2_font_helvR12_te; BOLD_FONT = u8g2_font_helvB12_te; break;
+      case 14: MAIN_FONT = u8g2_font_helvR14_te; BOLD_FONT = u8g2_font_helvB14_te; break;
+      default: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; break;
+    }
+  }
   invalidateMetrics();
 }
 
 static void loadSettings() {
-  applyFontSize(prefs.getInt("cfg_font", 8));
+  g_settings.readingFont = prefs.getInt("cfg_read_font", 0);
+  if (g_settings.readingFont != 0 && g_settings.readingFont != 1) g_settings.readingFont = 0;
+  applyReaderFonts(prefs.getInt("cfg_font", 8));
 
   g_settings.sleepSecs = (uint32_t)prefs.getInt("cfg_sleep", 120);
   if (g_settings.sleepSecs < 10) g_settings.sleepSecs = 10;
@@ -489,6 +534,7 @@ static void loadSettings() {
   g_settings.lineGap = prefs.getInt("cfg_lgap", 0);
   if (g_settings.lineGap < 0) g_settings.lineGap = 0;
   if (g_settings.lineGap > 4) g_settings.lineGap = 4;
+  g_settings.bionicReading = (prefs.getInt("cfg_bionic", 0) == 1);
 
   g_settings.readerLongPressAction = LONGPRESS_BOOKMARK;
   invalidateMetrics();
@@ -662,6 +708,9 @@ static void syncWakeState(bool reading) {
 }
 
 static void enterLibraryRoot(bool redraw) {
+  if (mode == MODE_READER && g_reader.currentBookKey.length() > 0) {
+    saveProgressThrottled(true);
+  }
   safeCloseCurrentBook();
   resetPreviewState();
   resetNavigationState();
@@ -907,6 +956,127 @@ static int savedPageForBookPath(const String& path) {
   return (p < 0) ? 0 : p;
 }
 
+static bool readPageCacheHeader(const String& path, size_t expectedSize, uint16_t& outCount) {
+  String cachePath = pageCachePathForBook(path);
+  File f = FS.open(cachePath, "r");
+  if (!f) return false;
+
+  uint32_t magic = 0;
+  uint32_t fileSize = 0;
+  uint16_t count = 0;
+
+  if (f.read((uint8_t*)&magic, sizeof(magic)) != sizeof(magic)) { f.close(); return false; }
+  if (f.read((uint8_t*)&fileSize, sizeof(fileSize)) != sizeof(fileSize)) { f.close(); return false; }
+  if (f.read((uint8_t*)&count, sizeof(count)) != sizeof(count)) { f.close(); return false; }
+  f.close();
+
+  if (magic != 0x50434F46UL || fileSize != (uint32_t)expectedSize || count == 0) return false;
+  outCount = count;
+  return true;
+}
+
+static int pageCacheCountForBook(const String& path, size_t expectedSize) {
+  uint16_t count = 0;
+  if (!readPageCacheHeader(path, expectedSize, count)) return 0;
+  return (int)count;
+}
+
+static bool pageCacheOffsetForPage(const String& path, size_t expectedSize, int page, uint32_t& outOffset) {
+  if (page < 0) return false;
+
+  String cachePath = pageCachePathForBook(path);
+  File f = FS.open(cachePath, "r");
+  if (!f) return false;
+
+  uint32_t magic = 0;
+  uint32_t fileSize = 0;
+  uint16_t count = 0;
+
+  if (f.read((uint8_t*)&magic, sizeof(magic)) != sizeof(magic)) { f.close(); return false; }
+  if (f.read((uint8_t*)&fileSize, sizeof(fileSize)) != sizeof(fileSize)) { f.close(); return false; }
+  if (f.read((uint8_t*)&count, sizeof(count)) != sizeof(count)) { f.close(); return false; }
+  if (magic != 0x50434F46UL || fileSize != (uint32_t)expectedSize || page >= (int)count) {
+    f.close();
+    return false;
+  }
+
+  size_t entryPos = 10 + ((size_t)page * sizeof(uint32_t));
+  if (!f.seek(entryPos)) { f.close(); return false; }
+  uint32_t off = 0;
+  if (f.read((uint8_t*)&off, sizeof(off)) != sizeof(off)) { f.close(); return false; }
+  f.close();
+
+  outOffset = off;
+  return true;
+}
+
+static int savedMaxPageForBookPath(const String& path) {
+  String key = prefKeyForBook(path);
+  int mp = prefs.getInt((key + "_mp").c_str(), -1);
+  if (mp >= 0) return mp;
+  return savedPageForBookPath(path);
+}
+
+static void updateMaxProgressForKey(const String& key, int pageIndex, uint32_t byteOffset) {
+  if (key.length() == 0 || pageIndex < 0) return;
+
+  int maxP = prefs.getInt((key + "_mp").c_str(), -1);
+  uint32_t maxO = prefs.getUInt((key + "_mo").c_str(), 0);
+
+  bool advance = (pageIndex > maxP) || (pageIndex == maxP && byteOffset > maxO) || (maxP < 0);
+  if (!advance) return;
+
+  prefs.putInt((key + "_mp").c_str(), pageIndex);
+  prefs.putUInt((key + "_mo").c_str(), byteOffset);
+}
+
+// Resolve furthest reading progress: stored _mp/_mo, or page-cache depth if further than _p.
+static bool resolveMaxProgressForBook(const String& path, int& outPage, uint32_t& outOffset) {
+  String key = prefKeyForBook(path);
+  int curP = prefs.getInt((key + "_p").c_str(), 0);
+  if (curP < 0) curP = 0;
+  uint32_t curO = prefs.getUInt((key + "_o").c_str(), 0);
+
+  int maxP = prefs.getInt((key + "_mp").c_str(), -1);
+  uint32_t maxO = prefs.getUInt((key + "_mo").c_str(), 0);
+  bool haveStoredMax = prefs.isKey((key + "_mp").c_str());
+
+  File f = FS.open(path, "r");
+  if (!f) {
+    outPage = curP;
+    outOffset = curO;
+    return false;
+  }
+  size_t fileSize = f.size();
+
+  int cacheCount = pageCacheCountForBook(path, fileSize);
+  if (cacheCount > 0) {
+    int cacheMaxPage = cacheCount - 1;
+    if (!haveStoredMax || cacheMaxPage > maxP) {
+      maxP = cacheMaxPage;
+      if (!pageCacheOffsetForPage(path, fileSize, maxP, maxO)) {
+        maxO = pageOffsetForPage(f, path, maxP);
+      }
+      haveStoredMax = true;
+      prefs.putInt((key + "_mp").c_str(), maxP);
+      prefs.putUInt((key + "_mo").c_str(), maxO);
+    }
+  }
+
+  if (!haveStoredMax) {
+    maxP = curP;
+    maxO = curO;
+    if (maxO == 0) maxO = pageOffsetForPage(f, path, maxP);
+  } else if (maxO == 0) {
+    maxO = pageOffsetForPage(f, path, maxP);
+  }
+
+  f.close();
+  outPage = maxP;
+  outOffset = maxO;
+  return (maxP > curP) || (maxO > curO + 32);
+}
+
 static String pageCachePathForBook(const String& path) {
   return String("/pc_") + prefKeyForBook(path) + ".bin";
 }
@@ -964,86 +1134,110 @@ static void savePageOffsetCacheForBook(const String& path, size_t fileSize) {
   f.close();
 }
 
-static void invalidateAllPageCaches() {
-  // Page offsets are computed from the current font size and line spacing.
-  // When either changes, page numbers stored in prefs are stale (page N at
-  // font 8 != page N at font 12), but the BYTE OFFSET of the reader's last
-  // position is layout-independent. We keep that offset (in pref key "_o")
-  // and set a "needs relocation" flag ("_n") so the next open of each book
-  // re-derives its page number from the byte offset in the new layout.
-  // For bookmarks we mirror the same byte-offset-is-truth approach: keep
-  // bmOffsets[] (those still point to the correct text after the layout
-  // change) and let the stored page number become a stale fallback used
-  // only by readBookmarkLabelAtOffset() when seek() fails.
-
-  // Capture the currently open book's byte offset BEFORE we wipe in-memory
-  // pageOffsets[]. saveProgressThrottled keeps "_o" reasonably current, but
-  // the user may have turned pages since the last throttle fire.
-  uint32_t openBookOffset = 0;
-  bool haveOpenBookOffset = false;
-  if (g_reader.currentBookKey.length() > 0
-      && g_reader.pageIndex >= 0
-      && g_reader.pageIndex < g_reader.knownPages) {
-    openBookOffset = g_reader.pageOffsets[g_reader.pageIndex];
-    haveOpenBookOffset = true;
-    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), openBookOffset);
-  }
-
-  resetOffsetCache();
-
-  // Remove all on-disk page-cache files (pc_*.bin).
-  // f.name() on arduino-esp32 3.x returns the BASENAME (no leading slash),
-  // so check both forms and rebuild the absolute path before remove().
-  File root = FS.open("/");
-  if (root && root.isDirectory()) {
-    File f = root.openNextFile();
-    while (f) {
-      String n = String(f.name());
-      String absPath = n.startsWith("/") ? n : ("/" + n);
-      bool removeIt = (n.startsWith("pc_") || n.startsWith("/pc_")) && n.endsWith(".bin");
-      f.close();
-      if (removeIt) FS.remove(absPath);
-      f = root.openNextFile();
-    }
-    root.close();
-  } else if (root) {
-    root.close();
-  }
-
-  // Mark every book as needing relocation on next open. We keep "_p" as-is
-  // (it's a hint and harmless if "_n" path overrides it) and rely on "_o" +
-  // the new layout to derive the correct page in openBookByIndex.
-  // Bookmarks are intentionally NOT touched: bmOffsets[] are still valid
-  // byte positions in the same file, so navigation lands on the right text.
-  // The stored bmPages[] page numbers are stale but only used by
-  // readBookmarkLabelAtOffset() as a fallback label ("p. N") when seek
-  // fails; in normal use the label is derived from the text at bmOffsets[j].
-  for (int i = 0; i < g_library.bookCount; i++) {
-    String key = prefKeyForBook(String(g_library.books[i].path));
-    prefs.putBool((key + "_n").c_str(), true);
-  }
-
-  // For the currently open book, reset in-memory pagination and relocate
-  // straight away using the byte offset we just captured. This avoids the
-  // user seeing page 1 momentarily before the next render.
+static void finishLayoutInvalidateOpenBook() {
   if (g_reader.currentBookPath.length() > 0) {
     g_reader.knownPages = 1;
     g_reader.pageOffsets[0] = 0;
     g_reader.pageIndex = 0;
     g_reader.eofReached = false;
     resetSaveThrottle();
-    if (haveOpenBookOffset && g_reader.file) {
-      relocateOpenBookToOffset(openBookOffset);
+    if (g_layoutInv.haveOpenBookOffset && g_reader.file) {
+      uint32_t anchor = g_layoutInv.openBookOffset;
+      relocateOpenBookToOffset(anchor);
       if (g_reader.currentBookKey.length() > 0) {
         prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
-        if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-          prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                        g_reader.pageOffsets[g_reader.pageIndex]);
-        }
+        prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), anchor);
         prefs.remove((g_reader.currentBookKey + "_n").c_str());
       }
     }
   }
+}
+
+static void cancelLayoutInvalidateWork() {
+  if (g_layoutInv.root) {
+    g_layoutInv.root.close();
+    g_layoutInv.root = File();
+  }
+  g_layoutInv.active = false;
+  g_layoutInv.phase = 0;
+  g_layoutInv.bookIdx = 0;
+  g_layoutInv.openBookOffset = 0;
+  g_layoutInv.haveOpenBookOffset = false;
+}
+
+static void requestInvalidateAllPageCaches() {
+  cancelLayoutInvalidateWork();
+  g_layoutInv.active = true;
+  g_layoutInv.phase = 0;
+}
+
+// Page-offset cache invalidation spread across loop() ticks so HTTP handlers
+// and button polling stay responsive (e.g. saving font settings in upload mode).
+static bool tickInvalidateAllPageCaches() {
+  if (!g_layoutInv.active) return true;
+
+  if (g_layoutInv.phase == 0) {
+    g_layoutInv.openBookOffset = 0;
+    g_layoutInv.haveOpenBookOffset = false;
+    if (g_reader.currentBookKey.length() > 0
+        && g_reader.currentBookPath.length() > 0
+        && (mode == MODE_READER || mode == MODE_BM_PREVIEW)) {
+      g_layoutInv.openBookOffset = readerTopByteOffset();
+      g_layoutInv.haveOpenBookOffset = true;
+      prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), g_layoutInv.openBookOffset);
+    }
+    resetOffsetCache();
+    g_layoutInv.bookIdx = 0;
+    g_layoutInv.root = FS.open("/");
+    if (g_layoutInv.root && g_layoutInv.root.isDirectory()) {
+      g_layoutInv.phase = 1;
+    } else {
+      if (g_layoutInv.root) g_layoutInv.root.close();
+      g_layoutInv.root = File();
+      g_layoutInv.phase = 2;
+    }
+    return false;
+  }
+
+  if (g_layoutInv.phase == 1) {
+    for (int n = 0; n < LAYOUT_INV_FS_FILES_PER_TICK; n++) {
+      File f = g_layoutInv.root.openNextFile();
+      if (!f) {
+        g_layoutInv.root.close();
+        g_layoutInv.root = File();
+        g_layoutInv.phase = 2;
+        return false;
+      }
+      String name = String(f.name());
+      String absPath = name.startsWith("/") ? name : ("/" + name);
+      bool removeIt = (name.startsWith("pc_") || name.startsWith("/pc_")) && name.endsWith(".bin");
+      f.close();
+      if (removeIt) FS.remove(absPath);
+    }
+    return false;
+  }
+
+  if (g_layoutInv.phase == 2) {
+    int end = min(g_layoutInv.bookIdx + LAYOUT_INV_BOOKS_PER_TICK, g_library.bookCount);
+    for (int i = g_layoutInv.bookIdx; i < end; i++) {
+      String key = prefKeyForBook(String(g_library.books[i].path));
+      prefs.putBool((key + "_n").c_str(), true);
+    }
+    g_layoutInv.bookIdx = end;
+    if (g_layoutInv.bookIdx < g_library.bookCount) return false;
+    g_layoutInv.phase = 3;
+  }
+
+  if (g_layoutInv.phase == 3) {
+    finishLayoutInvalidateOpenBook();
+    cancelLayoutInvalidateWork();
+    if (g_renderAfterLayoutInvalidate) {
+      g_renderAfterLayoutInvalidate = false;
+      if (mode == MODE_READER || mode == MODE_BM_PREVIEW) renderCurrentPage();
+    }
+  }
+
+  return true;
 }
 
 static void sanitizeListText(String& s) {
@@ -1111,6 +1305,10 @@ static String bmKeyFor(const String& bookKey) {
 static void deleteBookMetadata(const String& path) {
   String key = prefKeyForBook(path);
   prefs.remove((key + "_p").c_str());
+  prefs.remove((key + "_o").c_str());
+  prefs.remove((key + "_mp").c_str());
+  prefs.remove((key + "_mo").c_str());
+  prefs.remove((key + "_n").c_str());
   prefs.remove(bmKeyFor(key).c_str());
   String cachePath = pageCachePathForBook(path);
   if (FS.exists(cachePath)) FS.remove(cachePath);
@@ -1128,6 +1326,29 @@ static void migrateBookMetadata(const String& oldPath, const String& newPath) {
   if (progress >= 0) {
     prefs.putInt((newKey + "_p").c_str(), progress);
     prefs.remove((oldKey + "_p").c_str());
+  }
+
+  int maxProgress = prefs.getInt((oldKey + "_mp").c_str(), -1);
+  if (maxProgress >= 0) {
+    prefs.putInt((newKey + "_mp").c_str(), maxProgress);
+    prefs.remove((oldKey + "_mp").c_str());
+  }
+
+  if (prefs.isKey((oldKey + "_mo").c_str())) {
+    uint32_t maxOff = prefs.getUInt((oldKey + "_mo").c_str(), 0);
+    prefs.putUInt((newKey + "_mo").c_str(), maxOff);
+    prefs.remove((oldKey + "_mo").c_str());
+  }
+
+  uint32_t savedOff = prefs.getUInt((oldKey + "_o").c_str(), 0xFFFFFFFFUL);
+  if (savedOff != 0xFFFFFFFFUL) {
+    prefs.putUInt((newKey + "_o").c_str(), savedOff);
+    prefs.remove((oldKey + "_o").c_str());
+  }
+
+  if (prefs.getBool((oldKey + "_n").c_str(), false)) {
+    prefs.putBool((newKey + "_n").c_str(), true);
+    prefs.remove((oldKey + "_n").c_str());
   }
 
   uint8_t buf[1 + MAX_BOOKMARKS * 6] = {0};
@@ -1604,7 +1825,7 @@ static inline void resetSaveThrottle() {
   g_reader.lastSavedPage = -1;
 }
 
-static void saveProgressThrottled(bool force = false) {
+static void saveProgressThrottled(bool force) {
   if (g_reader.currentBookKey.length() == 0) return;
 
   if (!force) {
@@ -1614,11 +1835,15 @@ static void saveProgressThrottled(bool force = false) {
   }
 
   prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
-  // Persist the byte offset of the current page so font / line-gap changes can
-  // re-locate the reader at the same text position in the new layout.
+  // Persist the top-of-screen byte offset so font / spacing / bionic changes can
+  // re-locate the reader at the same line in the new layout.
+  uint32_t curOff = readerTopByteOffset();
+  prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), curOff);
+  if (g_reader.currentBookPath.length() > 0) {
+    prefs.putString("last_book_path", g_reader.currentBookPath);
+  }
   if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                  g_reader.pageOffsets[g_reader.pageIndex]);
+    updateMaxProgressForKey(g_reader.currentBookKey, g_reader.pageIndex, curOff);
   }
   g_reader.lastSaveMs = millis();
   g_reader.lastSavedPage = g_reader.pageIndex;
@@ -1963,6 +2188,125 @@ static bool lineEndsWithSpace(const String& s) {
   return s.length() > 0 && s[s.length() - 1] == ' ';
 }
 
+static bool isBionicWordLeadByte(uint8_t b) {
+  return (b >= '0' && b <= '9') ||
+         (b >= 'A' && b <= 'Z') ||
+         (b >= 'a' && b <= 'z') ||
+         (b >= 128);
+}
+
+static int utf8CharCount(const String& s) {
+  int count = 0;
+  for (int i = 0; i < (int)s.length();) {
+    int clen = utf8SafeCharLenAt(s, i);
+    if (clen <= 0) clen = 1;
+    i += clen;
+    count++;
+  }
+  return count;
+}
+
+static int bionicStrongCharsForWord(int charCount) {
+  if (charCount <= 0) return 0;
+  if (charCount <= 3) return 1;
+  int strong = charCount / 2;
+  if (strong < 1) strong = 1;
+  if (strong > 4) strong = 4;
+  return strong;
+}
+
+static int utf8ByteOffsetForCharCount(const String& s, int charCount) {
+  if (charCount <= 0) return 0;
+  int i = 0;
+  int seen = 0;
+  while (i < (int)s.length() && seen < charCount) {
+    int clen = utf8SafeCharLenAt(s, i);
+    if (clen <= 0) clen = 1;
+    i += clen;
+    seen++;
+  }
+  return i;
+}
+
+// Lays out reader line text; returns total width from x. If draw, renders at yBaseline.
+static int layoutReaderLineText(const String& text, int x, int yBaseline, bool draw) {
+  if (!g_settings.bionicReading) {
+    u8g2.setFont(MAIN_FONT);
+    if (draw) {
+      u8g2.setCursor(x, yBaseline);
+      u8g2.print(text.c_str());
+    }
+    return u8g2.getUTF8Width(text.c_str());
+  }
+
+  int cursorX = x;
+  int i = 0;
+  while (i < (int)text.length()) {
+    int segStart = i;
+    bool isSpace = (text[i] == ' ');
+    while (i < (int)text.length() && ((text[i] == ' ') == isSpace)) i++;
+    String seg = text.substring(segStart, i);
+    if (seg.length() == 0) continue;
+
+    if (isSpace) {
+      u8g2.setFont(MAIN_FONT);
+      if (draw) {
+        u8g2.setCursor(cursorX, yBaseline);
+        u8g2.print(seg.c_str());
+      }
+      cursorX += u8g2.getUTF8Width(seg.c_str());
+      continue;
+    }
+
+    uint8_t lead = (uint8_t)seg[0];
+    int chars = utf8CharCount(seg);
+    int strongChars = bionicStrongCharsForWord(chars);
+    int strongBytes = utf8ByteOffsetForCharCount(seg, strongChars);
+
+    if (!isBionicWordLeadByte(lead) || strongBytes <= 0 || strongBytes >= (int)seg.length()) {
+      u8g2.setFont(MAIN_FONT);
+      if (draw) {
+        u8g2.setCursor(cursorX, yBaseline);
+        u8g2.print(seg.c_str());
+      }
+      cursorX += u8g2.getUTF8Width(seg.c_str());
+      continue;
+    }
+
+    String strong = seg.substring(0, strongBytes);
+    String rest = seg.substring(strongBytes);
+
+    u8g2.setFont(BOLD_FONT);
+    if (draw) {
+      u8g2.setCursor(cursorX, yBaseline);
+      u8g2.print(strong.c_str());
+    }
+    cursorX += u8g2.getUTF8Width(strong.c_str());
+
+    if (rest.length() > 0) {
+      cursorX += BIONIC_STRONG_REST_GAP_PX;
+      u8g2.setFont(MAIN_FONT);
+      if (draw) {
+        u8g2.setCursor(cursorX, yBaseline);
+        u8g2.print(rest.c_str());
+      }
+      cursorX += u8g2.getUTF8Width(rest.c_str());
+    }
+  }
+
+  u8g2.setFont(MAIN_FONT);
+  return cursorX - x;
+}
+
+static int measureReaderLineTextWidth(const String& text) {
+  return layoutReaderLineText(text, 0, 0, false);
+}
+
+static void drawReaderLineText(const String& text, int x, int yBaseline) {
+  layoutReaderLineText(text, x, yBaseline, true);
+  u8g2.setFont(MAIN_FONT);
+}
+
 // ============================================================================
 //  Pagination / text layout
 // ============================================================================
@@ -1987,8 +2331,7 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
     trimTrailingSpaces(printable);
 
     if (draw) {
-      u8g2.setCursor(MARGIN_X, cursorY);
-      u8g2.print(printable.c_str());
+      drawReaderLineText(printable, MARGIN_X, cursorY);
       cursorY += m.lineH;
     }
     if (outText) {
@@ -2024,7 +2367,7 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
         int clen = utf8SafeCharLenAt(t, i);
         if (clen <= 0) break;
         String candidate = chunk + t.substring(i, i + clen);
-        if (u8g2.getUTF8Width(candidate.c_str()) > m.maxWidth) break;
+        if (measureReaderLineTextWidth(candidate) > m.maxWidth) break;
         chunk = candidate;
         i += clen;
       }
@@ -2047,7 +2390,7 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
     if (line.length() == 0) {
       trimLeadingSpaces(t);
       if (t.length() == 0) return 0;
-      if (u8g2.getUTF8Width(t.c_str()) > m.maxWidth) {
+      if (measureReaderLineTextWidth(t) > m.maxWidth) {
         return hardBreakToken(t, tPos);
       }
       line = t;
@@ -2060,12 +2403,12 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
     if (t.length() == 0) return 0;
 
     String candidate = line + t;
-    if (u8g2.getUTF8Width(candidate.c_str()) > m.maxWidth) {
+    if (measureReaderLineTextWidth(candidate) > m.maxWidth) {
       trimTrailingSpaces(line);
       flushLine(line);
       if (linesUsed >= m.maxLines) return safeReturn(tPos);
 
-      if (u8g2.getUTF8Width(t.c_str()) > m.maxWidth) {
+      if (measureReaderLineTextWidth(t) > m.maxWidth) {
         return hardBreakToken(t, tPos);
       } else {
         line = t;
@@ -2188,28 +2531,96 @@ static void ensureOffsetsUpTo(int targetPage) {
   }
 }
 
-// Locate the page containing `targetOffset` in the current font layout, then
-// position pageIndex one page earlier than that containing page (a small
-// re-read so the user never skips past their last position). Walks pages
-// forward via ensureOffsetsUpTo(); falls back to the last known page on
-// EOF / MAX_PAGES cap. Pagination of a multi-MB book can take many seconds,
-// so we yield periodically to keep the task watchdog and HTTP server happy.
+// Byte offset of the first visible line on the current reader screen.
+static uint32_t readerTopByteOffset() {
+  if (g_reader.lastPageStartOffset > 0) return g_reader.lastPageStartOffset;
+  if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
+    return g_reader.pageOffsets[g_reader.pageIndex];
+  }
+  return 0;
+}
+
+// Truncate the offset table after `page` and force that page to start at `startOffset`.
+static void setPageStartAndTruncateAfter(int page, uint32_t startOffset) {
+  g_reader.pageOffsets[page] = startOffset;
+  g_reader.knownPages = page + 1;
+  g_reader.eofReached = false;
+}
+
+// Locate the page that should display text starting at `targetOffset` in the
+// current layout. When the natural page break falls before targetOffset, force
+// that page to start at targetOffset so the top line stays the same after a
+// font / spacing / bionic change. Walks pages forward via ensureOffsetsUpTo();
+// falls back to the last known page on EOF / MAX_PAGES cap.
 static void relocateOpenBookToOffset(uint32_t targetOffset) {
+  resetOffsetCache();
+  g_reader.knownPages = 1;
+  g_reader.pageOffsets[0] = 0;
+  g_reader.eofReached = false;
+
   if (targetOffset == 0) {
     g_reader.pageIndex = 0;
     return;
   }
 
-  for (int k = 1; k < MAX_PAGES; k++) {
+  for (int k = 0; k < MAX_PAGES; k++) {
     ensureOffsetsUpTo(k);
     if ((k & 0x3F) == 0) yield();  // every 64 pages: feed WDT + service HTTP
-    if (g_reader.eofReached && (int)g_reader.knownPages <= k) break;
-    if (g_reader.pageOffsets[k] > targetOffset) {
-      int containing = k - 1;                                  // page that contains targetOffset
-      g_reader.pageIndex = (containing > 0) ? (containing - 1) : 0;  // one earlier, for re-read
+
+    uint32_t start = g_reader.pageOffsets[k];
+    if (start == targetOffset) {
+      g_reader.pageIndex = k;
+      return;
+    }
+
+    if (start > targetOffset) {
+      if (k > 0) {
+        k--;
+        start = g_reader.pageOffsets[k];
+      }
+      g_reader.pageIndex = k;
+      if (start < targetOffset) {
+        setPageStartAndTruncateAfter(k, targetOffset);
+        uint32_t next = buildNextOffset(targetOffset);
+        if (next > targetOffset && g_reader.knownPages < MAX_PAGES) {
+          g_reader.pageOffsets[g_reader.knownPages] = next;
+          g_reader.knownPages++;
+        } else if (next <= targetOffset) {
+          g_reader.eofReached = true;
+        }
+      }
+      return;
+    }
+
+    if (g_reader.eofReached && (int)g_reader.knownPages <= k + 1) {
+      g_reader.pageIndex = k;
+      if (start < targetOffset) {
+        setPageStartAndTruncateAfter(k, targetOffset);
+        uint32_t next = buildNextOffset(targetOffset);
+        if (next > targetOffset && g_reader.knownPages < MAX_PAGES) {
+          g_reader.pageOffsets[g_reader.knownPages] = next;
+          g_reader.knownPages++;
+        }
+      }
+      return;
+    }
+
+    ensureOffsetsUpTo(k + 1);
+    if ((int)g_reader.knownPages > k + 1
+        && g_reader.pageOffsets[k + 1] > targetOffset) {
+      g_reader.pageIndex = k;
+      if (start < targetOffset) {
+        setPageStartAndTruncateAfter(k, targetOffset);
+        uint32_t next = buildNextOffset(targetOffset);
+        if (next > targetOffset && g_reader.knownPages < MAX_PAGES) {
+          g_reader.pageOffsets[g_reader.knownPages] = next;
+          g_reader.knownPages++;
+        }
+      }
       return;
     }
   }
+
   g_reader.pageIndex = (g_reader.knownPages > 0) ? (int)g_reader.knownPages - 1 : 0;
 }
 
@@ -2233,19 +2644,37 @@ static bool openBookByIndex(int idx) {
   g_reader.knownPages = 1;
   g_reader.pageOffsets[0] = 0;
   g_reader.eofReached = false;
-  loadPageOffsetCacheForBook(path, g_reader.file.size());
-  // If the layout changed since this book was last open ("_n" set by
-  // invalidateAllPageCaches), re-derive the page from the saved byte offset
-  // instead of trusting the now-stale "_p" page number.
-  if (prefs.getBool((g_reader.currentBookKey + "_n").c_str(), false)) {
+
+  bool needsRelayout = prefs.getBool((g_reader.currentBookKey + "_n").c_str(), false);
+  // Stale /pc_*.bin caches are from the old font layout — never load them when
+  // re-deriving position after a settings change.
+  if (!needsRelayout) {
+    loadPageOffsetCacheForBook(path, g_reader.file.size());
+  } else {
+    FS.remove(pageCachePathForBook(path));
+    resetOffsetCache();
+  }
+
+  if (needsRelayout) {
     uint32_t target = prefs.getUInt((g_reader.currentBookKey + "_o").c_str(), 0);
-    relocateOpenBookToOffset(target);
+    if (target > 0) {
+      relocateOpenBookToOffset(target);
+    } else {
+      int oldPage = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
+      if (oldPage < 0) oldPage = 0;
+      ensureOffsetsUpTo(oldPage);
+      g_reader.pageIndex = oldPage;
+      if (g_reader.pageIndex >= g_reader.knownPages) {
+        g_reader.pageIndex = g_reader.knownPages > 0 ? g_reader.knownPages - 1 : 0;
+      }
+    }
     prefs.remove((g_reader.currentBookKey + "_n").c_str());
     prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
+    uint32_t anchor = 0;
     if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-      prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                    g_reader.pageOffsets[g_reader.pageIndex]);
+      anchor = g_reader.pageOffsets[g_reader.pageIndex];
     }
+    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), anchor);
   } else {
     g_reader.pageIndex = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
     if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
@@ -2259,6 +2688,14 @@ static bool openBookByIndex(int idx) {
   int warmTarget = g_reader.pageIndex + PREFETCH_AHEAD_PAGES;
   if (warmTarget < 1) warmTarget = 1;
   ensureOffsetsUpTo(warmTarget);
+
+  if (!prefs.isKey((g_reader.currentBookKey + "_mp").c_str())) {
+    uint32_t curOff = 0;
+    if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
+      curOff = g_reader.pageOffsets[g_reader.pageIndex];
+    }
+    updateMaxProgressForKey(g_reader.currentBookKey, g_reader.pageIndex, curOff);
+  }
   return true;
 }
 
@@ -2976,76 +3413,110 @@ static void drawBookmarksList() {
 static String webUiStyle() {
   return String(
     "<style>"
-    ":root{--bg:#f3efe7;--card:#fff;--line:#ddd4c7;--line-soft:#ece5d9;--text:#1f2328;--muted:#667085;--link:#3c5a7a;--ok:#216e39;--okbg:#e7f6ec;--warn:#8a5a00;--warnbg:#fff4d6;--danger:#6e2a2a}"
+    ":root{"
+    "--bg:#f3efe7;--card:#fff;--line:#ddd4c7;--line-soft:#ece5d9;--text:#1f2328;--muted:#667085;--link:#3c5a7a;"
+    "--ok:#216e39;--okbg:#e7f6ec;--warn:#8a5a00;--warnbg:#fff4d6;--danger-bg:#b42318;--danger-fg:#fff;"
+    "--pill-bg:#f6f2ea;--pill-fg:#6b6358;--pre-bg:#fcfaf7;--stat-bg:#fcfaf7;--bar-bg:#ece5d9;--bar-bd:#e0d7ca;--bar-fill:#3c5a7a;"
+    "--ban-ok-bd:#cfe9d7;--ban-warn-bd:#ecd9a3;--btn-bg:#1f2328;--btn-fg:#fff;--btn-sec-bg:#eef2f6;--btn-sec-fg:#334e68;--btn-sec-bd:#d8e0e8;"
+    "--inp-bd:#c9c2b8;--inp-bg:#fff;--err:#b91c1c;--settings-row-bd:var(--line-soft)}"
+    "html[data-theme=dark]{"
+    "--bg:#14161c;--card:#1c2028;--line:#343a46;--line-soft:#262b34;--text:#e8eaef;--muted:#9aa3b2;--link:#8ab4f8;"
+    "--ok:#7dd89a;--okbg:#163526;--warn:#e6c84e;--warnbg:#3a3220;--danger-bg:#f56565;--danger-fg:#140505;"
+    "--pill-bg:#262b34;--pill-fg:#b4bcc8;--pre-bg:#12151c;--stat-bg:#12151c;--bar-bg:#262b34;--bar-bd:#343a46;--bar-fill:#8ab4f8;"
+    "--ban-ok-bd:#2d5a40;--ban-warn-bd:#5c4f24;--btn-bg:#e8eaef;--btn-fg:#14161c;--btn-sec-bg:#2a3140;--btn-sec-fg:#e8eaef;--btn-sec-bd:#3d4656;"
+    "--inp-bd:#454d5c;--inp-bg:#0f1218;--err:#f87171}"
     "*{box-sizing:border-box}"
     "body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,sans-serif}"
     ".wrap{max-width:820px;margin:0 auto;padding:18px}"
     ".wide{max-width:1020px}"
-    ".top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}"
+    ".top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px;flex-wrap:wrap}"
     ".top a,.link{color:var(--link);text-decoration:none}"
     ".top a:hover,.link:hover{text-decoration:underline}"
+    ".top-side{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;justify-content:flex-end;flex:1;min-width:0}"
     ".muted{color:var(--muted);font-size:13px}"
     ".card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 15px;margin:0 0 14px;box-shadow:0 1px 0 rgba(0,0,0,.03)}"
+    "html[data-theme=dark] .card{box-shadow:0 1px 0 rgba(255,255,255,.04)}"
     ".grid{display:grid;gap:12px}"
     ".actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}"
-    ".nav{display:flex;flex-wrap:wrap;gap:10px 14px;font-size:14px}"
+    ".nav{display:flex;flex-wrap:wrap;gap:10px 14px;font-size:14px;align-items:center}"
     ".nav a{color:var(--link);text-decoration:none}"
     ".list{list-style:none;padding:0;margin:0}"
     ".list li{padding:11px 0;border-top:1px solid var(--line-soft)}"
     ".list li:first-child{border-top:0;padding-top:0}"
     ".row{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}"
     ".meta{color:var(--muted);font-size:13px}"
-    ".pill{display:inline-block;background:#f6f2ea;color:#6b6358;border-radius:999px;padding:3px 8px;font-size:12px}"
-    ".pre{white-space:pre-wrap;line-height:1.45;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fcfaf7}"
-    ".danger{background:var(--danger)}"
-    ".banner-ok{background:var(--okbg);color:var(--ok);border:1px solid #cfe9d7;border-radius:12px;padding:12px 13px;margin-bottom:14px}"
-    ".banner-warn{background:var(--warnbg);color:var(--warn);border:1px solid #ecd9a3;border-radius:12px;padding:12px 13px;margin-bottom:14px}"
+    ".pill{display:inline-block;background:var(--pill-bg);color:var(--pill-fg);border-radius:999px;padding:3px 8px;font-size:12px}"
+    ".pre{white-space:pre-wrap;line-height:1.45;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--pre-bg)}"
+    ".danger{background:var(--danger-bg);color:var(--danger-fg)}"
+    ".banner-ok{background:var(--okbg);color:var(--ok);border:1px solid var(--ban-ok-bd);border-radius:12px;padding:12px 13px;margin-bottom:14px}"
+    ".banner-warn{background:var(--warnbg);color:var(--warn);border:1px solid var(--ban-warn-bd);border-radius:12px;padding:12px 13px;margin-bottom:14px}"
     ".stats{display:grid;gap:10px;grid-template-columns:repeat(2,minmax(0,1fr));margin-top:12px}"
-    ".stat{padding:11px 12px;border:1px solid var(--line-soft);border-radius:12px;background:#fcfaf7}"
+    ".stat{padding:11px 12px;border:1px solid var(--line-soft);border-radius:12px;background:var(--stat-bg)}"
     ".stat b{display:block;font-size:17px;line-height:1.2;margin-top:2px}"
-    ".bar{height:10px;border-radius:999px;background:#ece5d9;overflow:hidden;border:1px solid #e0d7ca;margin-top:12px}"
-    ".bar > span{display:block;height:100%;background:#3c5a7a}"
+    ".bar{height:10px;border-radius:999px;background:var(--bar-bg);overflow:hidden;border:1px solid var(--bar-bd);margin-top:12px}"
+    ".bar > span{display:block;height:100%;background:var(--bar-fill)}"
     ".stack{display:grid;gap:8px}"
     ".small{font-size:13px}"
-    "button,.btn{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:10px;background:#1f2328;color:#fff;padding:10px 14px;font:600 14px system-ui,sans-serif;text-decoration:none;cursor:pointer}"
-    ".btn.secondary{background:#eef2f6;color:#334e68;border:1px solid #d8e0e8}"
-    "input[type=text],input[type=file],select{width:100%;box-sizing:border-box;border:1px solid #c9c2b8;border-radius:10px;background:#fff;padding:10px;font:inherit}"
+    "button,.btn{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:10px;background:var(--btn-bg);color:var(--btn-fg);padding:10px 14px;font:600 14px system-ui,sans-serif;text-decoration:none;cursor:pointer}"
+    ".btn.secondary{background:var(--btn-sec-bg);color:var(--btn-sec-fg);border:1px solid var(--btn-sec-bd)}"
+    "input[type=text],input[type=file],select{width:100%;box-sizing:border-box;border:1px solid var(--inp-bd);border-radius:10px;background:var(--inp-bg);color:var(--text);padding:10px;font:inherit}"
+    "input[type=checkbox],input[type=radio]{accent-color:var(--link)}"
+    ".theme-toggle{padding:8px 12px;font-size:13px;white-space:nowrap}"
+    ".theme-toggle .tgd{display:none}"
+    "html[data-theme=dark] .theme-toggle .tgl{display:none}"
+    "html[data-theme=dark] .theme-toggle .tgd{display:inline !important}"
+    ".text-err{color:var(--err);font-weight:600}"
     "h1,h2,h3,p{margin:0}"
     "h1,h2,h3{margin-bottom:6px}"
     "p + p{margin-top:10px}"
     "@media(min-width:760px){.stats{grid-template-columns:repeat(4,minmax(0,1fr))}}"
-    "@media(max-width:640px){.row,.top{flex-direction:column}.wrap{padding:14px}}"
+    "@media(max-width:640px){.row,.top{flex-direction:column}.top-side{justify-content:flex-start}.wrap{padding:14px}}"
     "</style>"
+  );
+}
+
+static String webUiThemeScript() {
+  return String(
+    "<script>"
+    "(function(){"
+    "var k='palaTheme',r=document.documentElement;"
+    "function S(t){r.dataset.theme=(t==='dark')?'dark':'light';try{localStorage.setItem(k,(t==='dark')?'dark':'light')}catch(e){}}"
+    "function I(){var v=null;try{v=localStorage.getItem(k)}catch(e){}"
+    "if(v==='dark'||v==='light')S(v);"
+    "else S(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}"
+    "I();window.palaToggleTheme=function(){S(r.dataset.theme==='dark'?'light':'dark')};"
+    "})();"
+    "</script>"
   );
 }
 
 static String webPageStart(const String& title, const String& subtitle, const String& navHtml, bool wide = false) {
   String out;
-  out.reserve(1100);
-  out = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>";
+  out.reserve(2200);
+  out = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='color-scheme' content='light dark'><title>";
   out += title;
   out += "</title>";
   out += webUiStyle();
+  out += webUiThemeScript();
   out += "</head><body><div class='wrap";
   if (wide) out += " wide";
   out += "'><div class='top'><div><h1>";
   out += title;
   out += "</h1><div class='muted'>";
   out += subtitle;
-  out += "</div></div>";
+  out += "</div></div><div class='top-side'>";
   if (navHtml.length() > 0) {
     out += "<div class='nav'>";
     out += navHtml;
     out += "</div>";
   }
-  out += "</div>";
+  out += "<button type='button' class='btn secondary theme-toggle' onclick='palaToggleTheme()' title='Light or dark appearance'><span class='tgl'>Dark mode</span><span class='tgd' style='display:none'>Light mode</span></button></div></div>";
   return out;
 }
 
 static String webPageEnd() {
   return String("</div></body></html>");
 }
-
 static String htmlEscape(const String& in) {
   String out;
   out.reserve(in.length() + 16);
@@ -3132,6 +3603,156 @@ static String readPageTextForWeb(const String& path, int page) {
   out.trim();
   if (out.length() == 0) out = "(empty)";
   return out;
+}
+
+static int pageIndexForByteOffset(const String& path, uint32_t targetOffset) {
+  if (targetOffset == 0) return 0;
+
+  File f = FS.open(path, "r");
+  if (!f) return 0;
+
+  size_t fileSize = f.size();
+  if (fileSize > 0 && targetOffset >= fileSize) targetOffset = (uint32_t)(fileSize - 1);
+
+  int page = 0;
+  uint32_t off = 0;
+  while (off < targetOffset && page < MAX_PAGES - 1) {
+    uint32_t next = buildNextOffsetFor(f, off);
+    if (next <= off) break;
+    if (next > targetOffset) {
+      f.close();
+      return page;
+    }
+    off = next;
+    page++;
+    if ((page & 0x3F) == 0) yield();
+  }
+
+  f.close();
+  return page;
+}
+
+static void setBookReadingPosition(const String& path, int pageIndex, uint32_t byteOffset) {
+  String key = prefKeyForBook(path);
+  if (pageIndex < 0) pageIndex = 0;
+  prefs.putInt((key + "_p").c_str(), pageIndex);
+  prefs.putUInt((key + "_o").c_str(), byteOffset);
+  updateMaxProgressForKey(key, pageIndex, byteOffset);
+
+  if (g_reader.currentBookPath == path) {
+    g_reader.pageIndex = pageIndex;
+    resetSaveThrottle();
+    saveProgressThrottled(true);
+    if (g_reader.file) {
+      savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
+    }
+  }
+}
+
+static String bookViewerExtraStyle() {
+  return String("<style>") +
+    String(
+    ".bv-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px}"
+    ".bv-toolbar label{font-size:13px;color:var(--muted)}"
+    ".bv-reader{font-size:18px;line-height:1.55;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--pre-bg);max-height:70vh;overflow:auto;overflow-x:hidden;word-wrap:break-word;overflow-wrap:break-word}"
+    ".bv-sent{cursor:pointer;border-radius:4px;padding:0 1px}"
+    ".bv-sent:hover{background:var(--pill-bg)}"
+    ".bv-sent.sel{background:var(--link);color:#fff}"
+    ".bv-sent.find-hit{background:var(--warnbg);outline:1px solid var(--warn)}"
+    ".bv-sent.find-cur{outline:2px solid var(--link);background:var(--pill-bg)}"
+    ".bv-progressrow{display:flex;justify-content:flex-start;margin:0 0 12px}"
+    ".bv-jumpbar{position:fixed;left:0;right:0;bottom:0;padding:12px 16px;background:var(--card);border-top:1px solid var(--line);display:none;justify-content:center;gap:10px;flex-wrap:wrap;z-index:20;box-shadow:0 -4px 16px rgba(0,0,0,.08)}"
+    "html[data-theme=dark] .bv-jumpbar{box-shadow:0 -4px 16px rgba(0,0,0,.35)}"
+    ".bv-jumpbar.show{display:flex}"
+    "body:has(.bv-jumpbar.show) .wrap{padding-bottom:64px}"
+    ".bv-status{font-size:13px;color:var(--muted);min-height:1.2em;margin-top:8px}"
+    ".bv-findrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex:1;min-width:200px}"
+    ".bv-findrow input{flex:1;min-width:140px}"
+  ) + String("</style>");
+}
+
+static String bookViewerScript() {
+  return String(
+    "<script>"
+    "(function(){"
+    "var B=window.PALA_BOOK||{},root=document.getElementById('bvReader'),statusEl=document.getElementById('bvStatus'),"
+    "jumpBar=document.getElementById('bvJumpBar'),fontEl=document.getElementById('bvFont'),findEl=document.getElementById('bvFind'),"
+    "selOff=-1,selEl=null,fullText='',sentEls=[],findHits=[],findCur=-1;"
+    "function setStatus(t){if(statusEl)statusEl.textContent=t||'';}"
+    "function utf8ByteLen(ch){var c=ch.codePointAt(0);if(c<=0x7F)return 1;if(c<=0x7FF)return 2;if(c<=0xFFFF)return 3;return 4;}"
+    "function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}"
+    "function loadFont(){var v=18;try{v=parseInt(localStorage.getItem('palaBvFont')||'18',10)}catch(e){}"
+    "if(fontEl){fontEl.value=v;root.style.fontSize=v+'px';fontEl.oninput=function(){var n=parseInt(fontEl.value,10)||18;"
+    "root.style.fontSize=n+'px';try{localStorage.setItem('palaBvFont',String(n))}catch(e){}};}}"
+    "function splitSentences(text){var out=[],i=0,byteOff=0,n=text.length,pendingNl=0;"
+    "while(i<n){var nl=pendingNl;pendingNl=0;while(i<n&&/\\s/.test(text[i])){if(text[i]==='\\n')nl++;byteOff+=utf8ByteLen(text[i]);i++;}"
+    "if(i>=n)break;var start=i,startByte=byteOff;"
+    "while(i<n){var ch=text[i],end=false;"
+    "if(ch==='\\n'||ch==='\\r'){end=true;i++;byteOff+=utf8ByteLen(ch);pendingNl=1;break;}"
+    "if((ch==='.'||ch==='!'||ch==='?')&&(i+1>=n||/\\s/.test(text[i+1]))){i++;byteOff+=utf8ByteLen(ch);end=true;break;}"
+    "byteOff+=utf8ByteLen(ch);i++;}"
+    "var slice=text.slice(start,i);if(slice.trim().length)out.push({t:slice,off:startByte,nl:nl});"
+    "if(!end&&i>=n)break;}return out;}"
+    "function selectSentence(el){if(!el)return;if(selEl)selEl.classList.remove('sel');"
+    "selEl=el;selEl.classList.add('sel');selOff=parseInt(el.getAttribute('data-off')||'0',10);jumpBar.classList.add('show');}"
+    "function renderSentences(sents){var html='';for(var j=0;j<sents.length;j++){"
+    "if(j>0){if(sents[j].nl>0){for(var b=0;b<sents[j].nl;b++)html+='<br>';}else html+=' ';}"
+    "html+='<span class=\"bv-sent\" data-off=\"'+sents[j].off+'\">'+esc(sents[j].t)+'</span>';}"
+    "root.innerHTML=html;sentEls=root.querySelectorAll('.bv-sent');"
+    "for(var k=0;k<sentEls.length;k++){sentEls[k].onclick=function(ev){ev.stopPropagation();selectSentence(this);};}}"
+    "function clearFindMarks(){for(var i=0;i<sentEls.length;i++)sentEls[i].classList.remove('find-hit','find-cur');findHits=[];findCur=-1;}"
+    "function buildFindHits(){findHits=[];var q=(findEl&&findEl.value||'').trim();if(!q)return 0;"
+    "var ql=q.toLowerCase();for(var i=0;i<sentEls.length;i++){if(sentEls[i].textContent.toLowerCase().indexOf(ql)>=0)findHits.push(i);}"
+    "return findHits.length;}"
+    "function showFindMatch(){if(findCur<0||findCur>=findHits.length)return;"
+    "for(var i=0;i<sentEls.length;i++)sentEls[i].classList.remove('find-cur');"
+    "for(var h=0;h<findHits.length;h++)sentEls[findHits[h]].classList.add('find-hit');"
+    "var el=sentEls[findHits[findCur]];el.classList.add('find-cur');el.scrollIntoView({behavior:'smooth',block:'center'});"
+    "setStatus('Match '+(findCur+1)+' of '+findHits.length);}"
+    "function goFind(dir){var q=(findEl&&findEl.value||'').trim();if(!q){setStatus('Enter search text.');return;}"
+    "if(dir===0){clearFindMarks();if(!buildFindHits()){setStatus('No matches.');return;}findCur=0;}"
+    "else{if(!findHits.length){if(!buildFindHits()){setStatus('No matches. Press Find first.');return;}findCur=0;}"
+    "findCur+=dir;if(findCur>=findHits.length)findCur=0;if(findCur<0)findCur=findHits.length-1;}"
+    "showFindMatch();}"
+    "function sentenceAtOffset(off){if(!sentEls.length)return null;var best=null;"
+    "for(var i=0;i<sentEls.length;i++){var o=parseInt(sentEls[i].getAttribute('data-off')||'0',10);"
+    "if(o<=off)best=sentEls[i];else break;}return best;}"
+    "function scrollToByteOffset(off){var el=sentenceAtOffset(off);if(el)el.scrollIntoView({behavior:'smooth',block:'start'});}"
+    "document.getElementById('bvFindBtn').onclick=function(){goFind(0);};"
+    "document.getElementById('bvFindNextBtn').onclick=function(){goFind(1);};"
+    "document.getElementById('bvFindPrevBtn').onclick=function(){goFind(-1);};"
+    "if(findEl)findEl.onkeydown=function(e){if(e.key==='Enter')goFind(0);};"
+    "document.getElementById('bvMaxBtn').onclick=function(){"
+    "setStatus('Finding furthest progress...');"
+    "fetch('/readbook-max-progress?id='+B.id).then(function(r){return r.text();})"
+    ".then(function(t){var p=t.split('\\n');var off=parseInt(p[0],10)||0;var page=parseInt(p[1],10)||1;"
+    "var distinct=p[2]==='1';if(!distinct){setStatus('Furthest progress is your current place (page '+page+'). Read further on the device first.');return;}"
+    "var el=sentenceAtOffset(off);if(!el){setStatus('Could not find sentence at furthest progress.');return;}"
+    "selectSentence(el);el.scrollIntoView({behavior:'smooth',block:'center'});"
+    "setStatus('Selected furthest progress (page '+page+'). Tap Jump to save on device.');})"
+    ".catch(function(){setStatus('Could not load progress position.');});};"
+    "document.getElementById('bvJumpBtn').onclick=function(){"
+    "if(selOff<0){setStatus('Select a sentence first.');return;}"
+    "setStatus('Saving jump position...');"
+    "var body='id='+encodeURIComponent(B.id)+'&offset='+encodeURIComponent(selOff);"
+    "fetch('/jumpoffset',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
+    ".then(function(r){return r.text();})"
+    ".then(function(t){setStatus(t||'Jump saved for device.');jumpBar.classList.remove('show');"
+    "if(selEl){selEl.classList.remove('sel');selEl=null;}selOff=-1;})"
+    ".catch(function(){setStatus('Jump failed.');});};"
+    "document.body.onclick=function(){if(selEl){selEl.classList.remove('sel');selEl=null;selOff=-1;jumpBar.classList.remove('show');}};"
+    "jumpBar.onclick=function(e){e.stopPropagation();};"
+    "loadFont();setStatus('Loading book...');"
+    "fetch('/readbook-text?id='+B.id).then(function(r){if(!r.ok)throw new Error('load');return r.text();})"
+    ".then(function(txt){fullText=txt;var sents=splitSentences(txt);renderSentences(sents);"
+    "setStatus(sents.length+' sentences. Tap a sentence, then Jump to set the device page.');"
+    "return fetch('/readbook-page-offset?id='+B.id+'&page='+(B.savedPage||1));})"
+    ".then(function(r){return r.text();})"
+    ".then(function(t){scrollToByteOffset(parseInt(t,10)||0);})"
+    ".catch(function(){setStatus('Failed to load book text.');});"
+    "})();"
+    "</script>"
+  );
 }
 
 // ============================================================================
@@ -3247,7 +3868,7 @@ static void handleFiles() {
 
       out += "<form method='POST' action='/jumppage' class='stack small' accept-charset='UTF-8' style='margin-top:10px'>";
       out += "<input type='hidden' name='id' value='" + String(i) + "'>";
-      out += "<div class='row' style='align-items:end;gap:10px'><div style='flex:1'><input type='text' name='page' value='" + String(savedPage) + "' inputmode='numeric' placeholder='Page'></div><div><button type='submit'>Jump</button></div></div>";
+      out += "<div class='row' style='align-items:end;gap:10px'><div style='flex:1'><input type='text' name='page' value='" + String(savedPage) + "' inputmode='numeric' placeholder='Page'></div><div><button type='submit'>Jump</button></div><div><a class='btn secondary' href='/read?id=" + String(i) + "'>Find</a></div></div>";
       out += "<div class='muted'>Set the page that should open next on the device.<br><span class='muted'>The first open may take a moment.</span></div></form>";
 
       out += "<form method='POST' action='/move' class='stack small' accept-charset='UTF-8' style='margin-top:10px'>";
@@ -3467,6 +4088,13 @@ static void handleJumpPageWeb() {
   String path = String(g_library.books[id].path);
   String key = prefKeyForBook(path);
   prefs.putInt((key + "_p").c_str(), zeroBasedPage);
+  File jf = FS.open(path, "r");
+  if (jf) {
+    uint32_t off = pageOffsetForPage(jf, path, zeroBasedPage);
+    prefs.putUInt((key + "_o").c_str(), off);
+    updateMaxProgressForKey(key, zeroBasedPage, off);
+    jf.close();
+  }
 
   if (g_reader.currentBookPath == path) {
     g_reader.pageIndex = zeroBasedPage;
@@ -3480,6 +4108,168 @@ static void handleJumpPageWeb() {
 
   server.sendHeader("Location", "/files");
   server.send(302, "text/plain", "");
+}
+
+static void handleReadBookWeb() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  String bookName = String(g_library.books[id].name);
+  int savedPage = savedPageForBookPath(String(g_library.books[id].path)) + 1;
+  int maxPage = savedMaxPageForBookPath(String(g_library.books[id].path)) + 1;
+  if (savedPage < 1) savedPage = 1;
+  if (maxPage < 1) maxPage = 1;
+
+  String out = webPageStart(
+    "Find",
+    htmlEscape(bookName),
+    "<a href='/files'>&#8592; Files</a><a href='/'>Home</a>",
+    true
+  );
+  out += bookViewerExtraStyle();
+  out += "<div class='card'><h2>";
+  out += htmlEscape(bookName);
+  out += "</h2><p class='muted'>Comfortable reading on phone or PC. Change font size, search, tap a sentence and Jump to set where the device opens next.</p>";
+  out += "<div class='bv-toolbar'><label>Font size <input type='range' id='bvFont' min='14' max='28' value='18'></label>";
+  out += "<div class='bv-findrow'><input type='text' id='bvFind' placeholder='Find in book...'>";
+  out += "<button type='button' id='bvFindBtn' class='btn secondary'>Find</button>";
+  out += "<button type='button' id='bvFindNextBtn' class='btn secondary'>Find next</button>";
+  out += "<button type='button' id='bvFindPrevBtn' class='btn secondary'>Find previous</button></div>";
+  out += "</div>";
+  out += "<div class='bv-progressrow'><button type='button' id='bvMaxBtn' class='btn secondary'>Select furthest progress</button></div>";
+  out += "<div id='bvReader' class='bv-reader'></div>";
+  out += "<div id='bvStatus' class='bv-status'></div></div>";
+  out += "<div id='bvJumpBar' class='bv-jumpbar'><button type='button' id='bvJumpBtn' class='btn'>Jump</button></div>";
+  out += "<script>window.PALA_BOOK={id:";
+  out += String(id);
+  out += ",savedPage:";
+  out += String(savedPage);
+  out += ",maxPage:";
+  out += String(maxPage);
+  out += "};</script>";
+  out += bookViewerScript();
+  out += webPageEnd();
+  server.send(200, "text/html; charset=utf-8", out);
+}
+
+static void handleReadBookTextWeb() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  String path = String(g_library.books[id].path);
+  File f = FS.open(path, "r");
+  if (!f) {
+    server.send(500, "text/plain; charset=utf-8", "open failed");
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(f, "text/plain; charset=utf-8");
+  f.close();
+}
+
+static void handleReadBookMaxProgressWeb() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  String path = String(g_library.books[id].path);
+  int maxPage = 0;
+  uint32_t maxOffset = 0;
+  bool distinct = resolveMaxProgressForBook(path, maxPage, maxOffset);
+
+  String out = String(maxOffset);
+  out += "\n";
+  out += String(maxPage + 1);
+  out += "\n";
+  out += distinct ? "1" : "0";
+  server.send(200, "text/plain; charset=utf-8", out);
+}
+
+static void handleReadBookPageOffsetWeb() {
+  if (!server.hasArg("id") || !server.hasArg("page")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id/page");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  int page = server.arg("page").toInt();
+  if (page < 1) page = 1;
+  int zeroBasedPage = page - 1;
+
+  String path = String(g_library.books[id].path);
+  File f = FS.open(path, "r");
+  if (!f) {
+    server.send(500, "text/plain; charset=utf-8", "0");
+    return;
+  }
+
+  uint32_t off = pageOffsetForPage(f, path, zeroBasedPage);
+  f.close();
+  server.send(200, "text/plain; charset=utf-8", String(off));
+}
+
+static void handleJumpOffsetWeb() {
+  if (!server.hasArg("id") || !server.hasArg("offset")) {
+    server.send(400, "text/plain; charset=utf-8", "missing id/offset");
+    return;
+  }
+
+  loadBooks();
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= g_library.bookCount) {
+    server.send(400, "text/plain; charset=utf-8", "bad id");
+    return;
+  }
+
+  uint32_t offset = (uint32_t)server.arg("offset").toInt();
+  String path = String(g_library.books[id].path);
+  File f = FS.open(path, "r");
+  if (f) {
+    size_t sz = f.size();
+    if (sz > 0 && offset >= sz) offset = (uint32_t)(sz - 1);
+    f.close();
+  }
+
+  int pageIndex = pageIndexForByteOffset(path, offset);
+  setBookReadingPosition(path, pageIndex, offset);
+
+  String msg = "Jump saved. Device will open near page ";
+  msg += String(pageIndex + 1);
+  msg += " at this sentence.";
+  server.send(200, "text/plain; charset=utf-8", msg);
 }
 
 static void handleUploadDone() {
@@ -3872,6 +4662,400 @@ static void handleListClearDoneWeb() {
   server.send(302, "text/plain", "");
 }
 
+static String sleepSlotPath(int slot) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "/sleep-slot-%d.bin", slot);
+  return String(buf);
+}
+
+static int collectSleepSlots(int outSlots[MAX_MULTI_SLEEP_SLOTS]) {
+  int c = 0;
+  for (int i = 0; i < MAX_MULTI_SLEEP_SLOTS; i++) {
+    if (FS.exists(sleepSlotPath(i))) {
+      if (outSlots && c < MAX_MULTI_SLEEP_SLOTS) outSlots[c] = i;
+      c++;
+    }
+  }
+  return c;
+}
+
+static int firstFreeSleepSlot() {
+  for (int i = 0; i < MAX_MULTI_SLEEP_SLOTS; i++) {
+    if (!FS.exists(sleepSlotPath(i))) return i;
+  }
+  return -1;
+}
+
+static int parseSleepSlotArg(const String& argValue) {
+  if (argValue.length() == 0) return -1;
+  int slot = argValue.toInt();
+  if (slot < 0 || slot >= MAX_MULTI_SLEEP_SLOTS) return -1;
+  return slot;
+}
+
+static int loadSleepCycleIndex() {
+  File f = FS.open("/sleep-cycle.idx", "r");
+  if (!f) return 0;
+  String s = f.readString();
+  f.close();
+  s.trim();
+  if (s.length() == 0) return 0;
+  int v = s.toInt();
+  if (v < 0) v = 0;
+  return v;
+}
+
+static void saveSleepCycleIndex(int idx) {
+  if (idx < 0) idx = 0;
+  File f = FS.open("/sleep-cycle.idx", "w");
+  if (!f) return;
+  f.print(String(idx));
+  f.close();
+}
+
+static uint8_t reverseBits8(uint8_t b) {
+  b = (uint8_t)(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
+  b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
+  b = (uint8_t)(((b & 0xAA) >> 1) | ((b & 0x55) << 1));
+  return b;
+}
+
+static String screensaverEditorHtml(bool multiScreensaver, bool hasFreeSlot) {
+  String out;
+  out.reserve(11800);
+  out +=
+    "<style>"
+    ".ss-wrap{display:grid;gap:12px}"
+    ".ss-card{border:1px solid var(--line-soft);border-radius:12px;padding:10px 11px;background:var(--stat-bg)}"
+    ".ss-grid{display:grid;gap:10px;grid-template-columns:repeat(2,minmax(0,1fr))}"
+    ".ss-grid .full{grid-column:1/-1}"
+    ".ss-grid > div{min-width:0}"
+    ".ss-adv{border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--card)}"
+    ".ss-adv summary{cursor:pointer;font-weight:600;list-style:none}"
+    ".ss-adv summary::-webkit-details-marker{display:none}"
+    ".ss-adv summary:after{content:'▾';float:right;color:var(--muted)}"
+    ".ss-adv[open] summary:after{content:'▴'}"
+    ".ss-adv-body{margin-top:10px}"
+    ".ss-label-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 0 6px}"
+    ".ss-value{font-size:12px;color:var(--muted);white-space:nowrap}"
+    ".ss-value-editable{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}"
+    ".ss-value-editable:hover{color:var(--link)}"
+    ".ss-value-input{width:4.8em;font-size:12px;padding:2px 5px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;text-align:right}"
+    ".ss-preview-wrap{display:flex;flex-direction:column;gap:8px;min-height:240px}"
+    ".ss-preview-stage{flex:1;display:flex;align-items:center;justify-content:center;min-height:140px}"
+    ".ss-preview-stage canvas{width:100%;max-width:520px;border:1px solid var(--line);border-radius:10px;background:#fff;image-rendering:pixelated;touch-action:none}"
+    ".ss-preview-wrap #ssResetBtn{align-self:flex-start;width:auto;padding:6px 12px;font-size:13px}"
+    ".ss-meta{font-size:12px;color:var(--muted)}"
+    ".ss-tip{font-size:12px;color:var(--muted)}"
+    ".ss-status{font-size:13px;color:var(--muted)}"
+    ".ss-wrap input[type=range]{display:block;width:100%;max-width:none;box-sizing:border-box}"
+    "@media(max-width:560px){.ss-grid{grid-template-columns:1fr}}"
+    "</style>";
+
+  out +=
+    "<div class='card'><h2>Screensaver editor</h2>"
+    "<p class='muted'>Edit on phone in browser and upload directly. Supports drag, pinch, and scroll zoom. "
+    "Output is always 250&times;122, 1-bit, 3904 bytes.</p>"
+    "<div class='ss-wrap'>"
+    "<div class='ss-card ss-grid'>"
+    "<div class='full'><div class='ss-label-row'><label for='ssEditFile'>Source image</label></div><input id='ssEditFile' type='file' accept='image/*'></div>"
+    "<div class='full'><div class='ss-label-row'><label for='ssTolerance'>Black tolerance</label><span class='ss-value ss-value-editable' id='ssToleranceLabel'>0%</span></div><input id='ssTolerance' type='range' min='-100' max='100' value='0'></div>"
+    "<div class='full'><label style='display:flex;gap:10px;align-items:center;font-weight:500'><input id='ssInvert' type='checkbox'><span>Invert black/white</span></label></div>"
+    "<div class='full'><details class='ss-adv'><summary>Precise Control</summary><div class='ss-adv-body ss-grid'>"
+    "<div><div class='ss-label-row'><label for='ssZoom'>Zoom</label><span class='ss-value ss-value-editable' id='ssZoomLabel'>100%</span></div><input id='ssZoom' type='range' min='10' max='400' value='100'></div>"
+    "<div><div class='ss-label-row'><label for='ssPanX'>Move X</label><span class='ss-value ss-value-editable' id='ssPanXLabel'>0 px</span></div><input id='ssPanX' type='range' min='-250' max='250' value='0'></div>"
+    "<div class='full'><div class='ss-label-row'><label for='ssPanY'>Move Y</label><span class='ss-value ss-value-editable' id='ssPanYLabel'>0 px</span></div><input id='ssPanY' type='range' min='-180' max='180' value='0'></div>"
+    "</div></details></div>"
+    "</div>"
+    "<div class='ss-card ss-preview-wrap'>"
+    "<label>Preview (drag to move, pinch or scroll to zoom)</label>"
+    "<div class='ss-preview-stage'><canvas id='ssPreview' width='250' height='122'></canvas></div>"
+    "<button type='button' class='btn secondary' id='ssResetBtn'>Reset fit</button>"
+    "<div class='ss-meta' id='ssMeta'>No image loaded</div>"
+    "</div>";
+
+  if (multiScreensaver) {
+    out +=
+      "<div class='ss-card'>"
+      "<div class='ss-label-row'><label for='ssDestination'>Destination</label></div>"
+      "<select id='ssDestination'>"
+      "<option value='slot' selected>Add to rotation slot (next free)</option>"
+      "<option value='single'>Single screensaver (/sleep.bin)</option>"
+      "</select></div>";
+  }
+
+  out +=
+    "<div class='actions'>"
+    "<button type='button' class='btn secondary' id='ssUploadBtn'>Upload edited image</button>"
+    "<span class='ss-status' id='ssUploadStatus'></span>"
+    "</div></div></div>";
+
+  out += "<script>"
+    "(function(){"
+    "if(window.__palaSleepEditorInit)return;"
+    "window.__palaSleepEditorInit=1;"
+    "var W=250,H=122,ROW=32,TOTAL=H*ROW;"
+    "var fileInput=document.getElementById('ssEditFile');"
+    "var tol=document.getElementById('ssTolerance');"
+    "var tolLbl=document.getElementById('ssToleranceLabel');"
+    "var zoom=document.getElementById('ssZoom');"
+    "var zoomLbl=document.getElementById('ssZoomLabel');"
+    "var panX=document.getElementById('ssPanX');"
+    "var panY=document.getElementById('ssPanY');"
+    "var panXLbl=document.getElementById('ssPanXLabel');"
+    "var panYLbl=document.getElementById('ssPanYLabel');"
+    "var inv=document.getElementById('ssInvert');"
+    "var canvas=document.getElementById('ssPreview');"
+    "var meta=document.getElementById('ssMeta');"
+    "var status=document.getElementById('ssUploadStatus');"
+    "var resetBtn=document.getElementById('ssResetBtn');"
+    "var uploadBtn=document.getElementById('ssUploadBtn');"
+    "var dstSel=document.getElementById('ssDestination');"
+    "var hasFreeSlot=";
+  out += hasFreeSlot ? "true" : "false";
+  out +=
+    ";"
+    "if(!fileInput||!tol||!zoom||!panX||!panY||!inv||!canvas||!meta||!status||!resetBtn||!uploadBtn)return;"
+    "var ctx=canvas.getContext('2d',{willReadFrequently:true});"
+    "var work=document.createElement('canvas');work.width=W;work.height=H;"
+    "var workCtx=work.getContext('2d',{willReadFrequently:true});"
+    "var sourceImage=null;"
+    "var isDragging=false;"
+    "var dragStartX=0,dragStartY=0,dragPanX=0,dragPanY=0;"
+    "var pointers={};"
+    "var pinch={active:false,startDist:0,startZoom:100,startPanX:0,startPanY:0,startMidX:0,startMidY:0};"
+    "function clamp(v,min,max){return v<min?min:(v>max?max:v)}"
+    "function thresholdFromTolerance(offset){"
+      "var o=clamp(parseInt(offset||0,10)||0,-100,100);"
+      "var delta=Math.round(o*(255-128)/100);"
+      "return clamp(128+delta,0,255);"
+    "}"
+    "var editingLbl=null;"
+    "function setLblText(lbl,text){if(lbl&&lbl!==editingLbl)lbl.textContent=text;}"
+    "function setPanLabels(){setLblText(panXLbl,panX.value+' px');setLblText(panYLbl,panY.value+' px');}"
+    "function setControlLabels(){"
+      "var tv=parseInt(tol.value,10)||0;"
+      "setLblText(tolLbl,(tv>0?'+':'')+tv+'%');"
+      "setLblText(zoomLbl,zoom.value+'%');"
+      "setPanLabels();"
+    "}"
+    "function bindValueEdit(lbl,slider){"
+      "if(!lbl||!slider)return;"
+      "lbl.title='Click to type a value';"
+      "function finishEdit(commit){"
+        "if(editingLbl!==lbl)return;"
+        "var inp=lbl.querySelector('input');"
+        "if(!inp)return;"
+        "if(commit){"
+          "var raw=String(inp.value).trim();"
+          "var n=parseInt(raw,10);"
+          "if(isNaN(n)&&raw.charAt(0)==='+')n=parseInt(raw.slice(1),10);"
+          "if(isNaN(n))n=parseInt(slider.value,10)||0;"
+          "n=clamp(n,parseInt(slider.min,10)||0,parseInt(slider.max,10)||0);"
+          "slider.value=String(n);"
+        "}"
+        "lbl.removeChild(inp);"
+        "editingLbl=null;"
+        "render();"
+      "}"
+      "function beginEdit(){"
+        "if(editingLbl||lbl.querySelector('input'))return;"
+        "editingLbl=lbl;"
+        "var inp=document.createElement('input');"
+        "inp.type='number';"
+        "inp.className='ss-value-input';"
+        "inp.min=slider.min;"
+        "inp.max=slider.max;"
+        "inp.step='1';"
+        "inp.value=String(parseInt(slider.value,10)||0);"
+        "lbl.textContent='';"
+        "lbl.appendChild(inp);"
+        "inp.focus();"
+        "if(inp.select)inp.select();"
+        "inp.addEventListener('keydown',function(e){"
+          "if(e.key==='Enter'){e.preventDefault();finishEdit(true);}"
+          "else if(e.key==='Escape'){e.preventDefault();finishEdit(false);}"
+        "});"
+        "inp.addEventListener('blur',function(){finishEdit(true);});"
+      "}"
+      "lbl.addEventListener('click',beginEdit);"
+    "}"
+    "bindValueEdit(tolLbl,tol);"
+    "bindValueEdit(zoomLbl,zoom);"
+    "bindValueEdit(panXLbl,panX);"
+    "bindValueEdit(panYLbl,panY);"
+    "function fitImage(){"
+      "if(!sourceImage)return;"
+      "zoom.value='100';panX.value='0';panY.value='0';setControlLabels();render();"
+    "}"
+    "function drawSourceToWork(){"
+      "workCtx.fillStyle='#fff';workCtx.fillRect(0,0,W,H);"
+      "if(!sourceImage)return;"
+      "var base=Math.min(W/sourceImage.width,H/sourceImage.height);"
+      "var scale=base*((parseInt(zoom.value,10)||100)/100);"
+      "if(!isFinite(scale)||scale<=0)scale=base;"
+      "var dw=Math.max(1,Math.round(sourceImage.width*scale));"
+      "var dh=Math.max(1,Math.round(sourceImage.height*scale));"
+      "var x=((W-dw)/2)+(parseInt(panX.value,10)||0);"
+      "var y=((H-dh)/2)+(parseInt(panY.value,10)||0);"
+      "workCtx.drawImage(sourceImage,x,y,dw,dh);"
+    "}"
+    "function toOneBit(){"
+      "var img=workCtx.getImageData(0,0,W,H);"
+      "var d=img.data;"
+      "var threshold=thresholdFromTolerance(tol.value);"
+      "var invert=!!inv.checked;"
+      "for(var i=0;i<d.length;i+=4){"
+        "var lum=((d[i]*299)+(d[i+1]*587)+(d[i+2]*114))/1000;"
+        "var white=(lum>=threshold);"
+        "if(invert)white=!white;"
+        "var c=white?255:0;"
+        "d[i]=c;d[i+1]=c;d[i+2]=c;d[i+3]=255;"
+      "}"
+      "ctx.putImageData(img,0,0);"
+      "return img;"
+    "}"
+    "function packBytes(img){"
+      "var d=img.data;"
+      "var out=new Uint8Array(TOTAL);"
+      "for(var y=0;y<H;y++){"
+        "for(var x=0;x<W;x++){"
+          "var i=(y*W+x)*4;"
+          "if(d[i]>=128){"
+            "var bi=(y*ROW)+(x>>3);"
+            "out[bi]=out[bi]|(1<<(x&7));"
+          "}"
+        "}"
+      "}"
+      "return out;"
+    "}"
+    "function render(){"
+      "setControlLabels();"
+      "drawSourceToWork();"
+      "var oneBit=toOneBit();"
+      "if(!sourceImage){meta.textContent='No image loaded';return null;}"
+      "var threshold=thresholdFromTolerance(tol.value);"
+      "meta.textContent='Preview: '+W+'x'+H+'  threshold '+threshold+'  bytes '+TOTAL;"
+      "return oneBit;"
+    "}"
+    "function pointerList(){var a=[];for(var k in pointers){a.push(pointers[k]);}return a;}"
+    "function dist(a,b){var dx=a.x-b.x,dy=a.y-b.y;return Math.sqrt(dx*dx+dy*dy);}"
+    "function mid(a,b){return{x:(a.x+b.x)/2,y:(a.y+b.y)/2};}"
+    "function beginPinchIfNeeded(){"
+      "var pts=pointerList();"
+      "if(pts.length===2){"
+        "pinch.active=true;"
+        "pinch.startDist=Math.max(8,dist(pts[0],pts[1]));"
+        "pinch.startZoom=parseInt(zoom.value,10)||100;"
+        "pinch.startPanX=parseInt(panX.value,10)||0;"
+        "pinch.startPanY=parseInt(panY.value,10)||0;"
+        "var m=mid(pts[0],pts[1]);"
+        "pinch.startMidX=m.x;pinch.startMidY=m.y;"
+      "} else {"
+        "pinch.active=false;"
+      "}"
+    "}"
+    "fileInput.addEventListener('change',function(){"
+      "var f=fileInput.files&&fileInput.files[0];"
+      "if(!f){sourceImage=null;render();return;}"
+      "status.textContent='';"
+      "var r=new FileReader();"
+      "r.onload=function(){"
+        "var im=new Image();"
+        "im.onload=function(){sourceImage=im;fitImage();};"
+        "im.onerror=function(){status.textContent='Could not decode image.';};"
+        "im.src=r.result;"
+      "};"
+      "r.onerror=function(){status.textContent='Could not read image.';};"
+      "r.readAsDataURL(f);"
+    "});"
+    "[tol,zoom,panX,panY,inv].forEach(function(el){el.addEventListener('input',render);el.addEventListener('change',render);});"
+    "resetBtn.addEventListener('click',function(){fitImage();status.textContent='';});"
+    "canvas.addEventListener('pointerdown',function(e){"
+      "pointers[e.pointerId]={x:e.clientX,y:e.clientY};"
+      "canvas.setPointerCapture(e.pointerId);"
+      "var pts=pointerList();"
+      "if(pts.length===1){"
+        "isDragging=true;dragStartX=e.clientX;dragStartY=e.clientY;dragPanX=parseInt(panX.value,10)||0;dragPanY=parseInt(panY.value,10)||0;"
+      "}"
+      "beginPinchIfNeeded();"
+    "});"
+    "canvas.addEventListener('pointermove',function(e){"
+      "if(!pointers[e.pointerId])return;"
+      "pointers[e.pointerId].x=e.clientX;"
+      "pointers[e.pointerId].y=e.clientY;"
+      "var pts=pointerList();"
+      "if(pinch.active&&pts.length===2){"
+        "var d=Math.max(8,dist(pts[0],pts[1]));"
+        "var ratio=d/pinch.startDist;"
+        "var newZoom=Math.round(pinch.startZoom*ratio);"
+        "zoom.value=String(clamp(newZoom,10,400));"
+        "var m=mid(pts[0],pts[1]);"
+        "panX.value=String(clamp(pinch.startPanX+Math.round(m.x-pinch.startMidX),-250,250));"
+        "panY.value=String(clamp(pinch.startPanY+Math.round(m.y-pinch.startMidY),-180,180));"
+        "render();"
+        "return;"
+      "}"
+      "if(isDragging&&pts.length===1){"
+        "panX.value=String(clamp(dragPanX+Math.round(e.clientX-dragStartX),-250,250));"
+        "panY.value=String(clamp(dragPanY+Math.round(e.clientY-dragStartY),-180,180));"
+        "render();"
+      "}"
+    "});"
+    "function endPointer(e){"
+      "delete pointers[e.pointerId];"
+      "var pts=pointerList();"
+      "if(pts.length===1){"
+        "isDragging=true;"
+        "dragStartX=pts[0].x;dragStartY=pts[0].y;"
+        "dragPanX=parseInt(panX.value,10)||0;dragPanY=parseInt(panY.value,10)||0;"
+      "} else {"
+        "isDragging=false;"
+      "}"
+      "beginPinchIfNeeded();"
+    "}"
+    "canvas.addEventListener('pointerup',endPointer);"
+    "canvas.addEventListener('pointercancel',endPointer);"
+    "canvas.addEventListener('wheel',function(e){"
+      "if(!sourceImage)return;"
+      "e.preventDefault();"
+      "var z=parseInt(zoom.value,10)||100;"
+      "var step=Math.max(2,Math.round(Math.abs(e.deltaY)/25));"
+      "var next=z-(e.deltaY>0?step:-step);"
+      "zoom.value=String(clamp(next,10,400));"
+      "render();"
+    "},{passive:false});"
+    "uploadBtn.addEventListener('click',function(){"
+      "if(!sourceImage){alert('Please choose an image first.');return;}"
+      "var img=render();"
+      "if(!img){status.textContent='Preview is not ready yet.';return;}"
+      "var bytes=packBytes(img);"
+      "var fd=new FormData();"
+      "fd.append('file',new Blob([bytes],{type:'application/octet-stream'}),'sleep-editor.bin');"
+      "var endpoint='/upload-sleep';"
+      "if(dstSel&&dstSel.value==='slot'){"
+        "if(!hasFreeSlot){status.textContent='All 8 rotation slots are full. Remove one first.';return;}"
+        "endpoint='/upload-sleep-slot';"
+      "}"
+      "status.textContent='Uploading...';"
+      "uploadBtn.disabled=true;"
+      "fetch(endpoint,{method:'POST',body:fd}).then(function(res){"
+        "if(!res.ok){return res.text().then(function(t){throw new Error(t||('HTTP '+res.status));});}"
+        "status.textContent='Upload complete. Refreshing...';"
+        "setTimeout(function(){window.location.href='/settings';},600);"
+      "}).catch(function(err){"
+        "var msg=err&&err.message?err.message:'error';"
+        "if(msg.indexOf('Please choose an image first.')>=0){alert(msg);status.textContent='';}"
+        "else{status.textContent='Upload failed: '+msg;}"
+      "}).finally(function(){uploadBtn.disabled=false;});"
+    "});"
+    "setControlLabels();"
+    "render();"
+    "})();"
+    "</script>";
+  return out;
+}
+
 static void handleSettings() {
   String sel8 = (g_settings.fontSize == 8) ? " selected" : "";
   String sel10 = (g_settings.fontSize == 10) ? " selected" : "";
@@ -3889,43 +5073,55 @@ static void handleSettings() {
   String lg1 = (g_settings.lineGap == 1) ? " selected" : "";
   String lg2 = (g_settings.lineGap == 2) ? " selected" : "";
   String lg3 = (g_settings.lineGap == 3) ? " selected" : "";
+  String bionicChecked = g_settings.bionicReading ? " checked" : "";
 
+  String rfDefault = (g_settings.readingFont == 0) ? " selected" : "";
+  String rfOpenDys = (g_settings.readingFont == 1) ? " selected" : "";
+
+  // Any /sleep.bin counts as "custom" for the web UI (legacy single-image mode).
   bool hasSleepImg = FS.exists("/sleep.bin");
+  bool multiScreensaver = (prefs.getInt("cfg_ss_multi", 0) == 1);
+  int sleepMode = prefs.getInt("cfg_ss_mode", 0);
+  if (sleepMode != 1) sleepMode = 0; // 0=sequential, 1=random
+  String ssmCycle = (sleepMode == 0) ? " checked" : "";
+  String ssmShuffle = (sleepMode == 1) ? " checked" : "";
+
+  int slotIds[MAX_MULTI_SLEEP_SLOTS];
+  int slotCount = collectSleepSlots(slotIds);
+  int nextSlot = firstFreeSleepSlot();
 
   String out;
-  out.reserve(4800);
-  out =
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Settings</title>"
-    "<style>"
-    "body{margin:0;background:#f3efe7;color:#1f2328;font:15px/1.45 system-ui,sans-serif}"
-    ".wrap{max-width:760px;margin:0 auto;padding:18px}"
-    ".top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}"
-    ".top a,.link{color:#3c5a7a;text-decoration:none}"
-    ".muted{color:#667085;font-size:13px}"
-    ".card{background:#fff;border:1px solid #ddd4c7;border-radius:14px;padding:14px 15px;margin:0 0 14px;box-shadow:0 1px 0 rgba(0,0,0,.03)}"
-    ".grid{display:grid;gap:12px}"
+  out.reserve(15000);
+  out = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='color-scheme' content='light dark'><title>Settings</title>";
+  out += webUiStyle();
+  out += "<style>"
+    ".wrap{max-width:760px}"
     "label{display:block;font-weight:600;margin:0 0 6px}"
-    "select,input[type=file]{width:100%;box-sizing:border-box;border:1px solid #c9c2b8;border-radius:10px;background:#fff;padding:10px;font:inherit}"
-    ".hint{margin:6px 0 0;color:#667085;font-size:12px}"
+    ".hint{margin:6px 0 0;color:var(--muted);font-size:12px}"
     ".actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}"
-    "button{border:0;border-radius:10px;background:#1f2328;color:#fff;padding:10px 14px;font:600 14px system-ui,sans-serif}"
     ".status{padding:10px 12px;border-radius:10px;font-size:14px;margin:10px 0 0}"
-    ".ok{background:#e7f6ec;color:#216e39}"
-    ".idle{background:#f6f2ea;color:#6b6358}"
+    ".ok{background:var(--okbg);color:var(--ok)}"
+    ".idle{background:var(--pill-bg);color:var(--pill-fg)}"
     "h1,h2{margin:0 0 6px}"
     "p{margin:0 0 10px}"
     "@media(min-width:620px){.grid.cols-2{grid-template-columns:1fr 1fr}}"
-    "</style></head><body><div class='wrap'>"
-    "<div class='top'><div><h1>Pala One Settings</h1><div class='muted'>Firmware " FW_VERSION " configuration page stored directly on the device.</div></div><a href='/'>&#8592; Home</a></div>"
-    "<div class='card'><h2>Reading</h2><form method='POST' action='/settings' accept-charset='UTF-8'><div class='grid cols-2'><div><label for='font'>Font size</label><select id='font' name='font'>"
-    "<option value='8'"; out += sel8; out += ">8px &mdash; tiny</option>";
+    "</style>";
+  out += webUiThemeScript();
+  out += "</head><body><div class='wrap'><div class='top'><div><h1>Pala One Settings</h1><div class='muted'>Firmware " FW_VERSION " configuration page stored directly on the device.</div></div><div class='top-side'><a class='btn secondary' href='/'>&#8592; Home</a><button type='button' class='btn secondary theme-toggle' onclick='palaToggleTheme()' title='Light or dark appearance'><span class='tgl'>Dark mode</span><span class='tgd' style='display:none'>Light mode</span></button></div></div>"
+    "<div class='card'><h2>Reading</h2><form method='POST' action='/settings' accept-charset='UTF-8'><div class='grid cols-2'><div><label for='font'>Font size</label><select id='font' name='font'>";
+  out += "<option value='8'"; out += sel8; out += ">8px &mdash; tiny</option>";
   out += "<option value='10'"; out += sel10; out += ">10px &mdash; small</option>";
   out += "<option value='12'"; out += sel12; out += ">12px &mdash; medium</option>";
   out += "<option value='14'"; out += sel14; out += ">14px &mdash; large</option>";
   out +=
-    "</select><div class='hint'>Controls how many lines fit on each page.</div></div>"
+    "</select><div class='hint'>Controls how many lines fit on each page.</div>"
+    "<label for='lgap' style='display:block;margin-top:12px'>Line spacing</label><select id='lgap' name='lgap'>";
+  out += "<option value='0'"; out += lg0; out += ">0 px &mdash; compact</option>";
+  out += "<option value='1'"; out += lg1; out += ">1 px &mdash; normal</option>";
+  out += "<option value='2'"; out += lg2; out += ">2 px &mdash; relaxed</option>";
+  out += "<option value='3'"; out += lg3; out += ">3 px &mdash; loose</option>";
+  out +=
+    "</select><div class='hint'>A small change here can make text much easier to scan.</div></div>"
     "<div><label for='sleep'>Sleep after</label><select id='sleep' name='sleep'>"
     "<option value='30'"; out += ss30; out += ">30 seconds</option>";
   out += "<option value='60'"; out += ss60; out += ">1 minute</option>";
@@ -3934,43 +5130,120 @@ static void handleSettings() {
   out += "<option value='600'"; out += ss600; out += ">10 minutes</option>";
   out += "<option value='1800'"; out += ss1800; out += ">30 minutes</option>";
   out += "</select><div class='hint'>Auto-sleep keeps battery draw low while idle.</div></div>";
-  out += "<div><label for='lgap'>Line spacing</label><select id='lgap' name='lgap'>";
-  out += "<option value='0'"; out += lg0; out += ">0 px &mdash; compact</option>";
-  out += "<option value='1'"; out += lg1; out += ">1 px &mdash; normal</option>";
-  out += "<option value='2'"; out += lg2; out += ">2 px &mdash; relaxed</option>";
-  out += "<option value='3'"; out += lg3; out += ">3 px &mdash; loose</option>";
-  out +=
-    "</select><div class='hint'>A small change here can make text much easier to scan.</div></div>"
+  out += "<div><label for='readfont'>Reading font</label><select id='readfont' name='readfont'>"
+    "<option value='0'";
+  out += rfDefault;
+  out += ">Default</option><option value='1'";
+  out += rfOpenDys;
+  out += ">OpenDyslexia</option></select>"
+    "<div class='hint'>OpenDyslexia uses embedded OpenDyslexic bitmap glyphs built into firmware.</div></div>"
+    "<div><label for='bionic'>Reading style</label><label style='display:flex;gap:10px;align-items:flex-start;font-weight:400;margin-top:10px'><input id='bionic' type='checkbox' name='bionic' value='1'";
+  out += bionicChecked;
+  out += "><span>Enable Bionic Reading (bold word starts for faster scanning).</span></label></div>"
     "</div>"
-    "<div class='actions' style='margin-top:24px;'><button type='submit'>Save settings</button><span class='muted'>No extra files, scripts, or fonts.</span></div></form></div>"
-    "<div class='card'><h2>Screensaver</h2>"
-    "<p>Upload raw XBM bytes: <b>3904 bytes</b>, 250&times;122 px, 1-bit, LSB-first, 32 bytes per row.</p>"
-    "<p class='muted'>Tip: use <a class='link' href='https://javl.github.io/image2cpp/' target='_blank'>image2cpp</a> with <b>Plain bytes</b>. Invert colors if needed.</p>";
+    "<div class='actions' style='margin-top:24px;'><button type='submit'>Save settings</button><span class='muted'>No extra files, scripts, or fonts.</span></div></form></div>";
 
-  if (hasSleepImg) {
-    out += "<div class='status ok'>&#10003; Custom screensaver active. <a class='link' href='/del-sleep' onclick=\"return confirm('Delete custom screensaver?')\">Delete</a></div>";
+  if (multiScreensaver) {
+    out += "<div class='card'><h2>Screensaver</h2>"
+      "<p>Images are raw XBM bytes: <b>3904 bytes</b>, 250&times;122 px, 1-bit, LSB-first, 32 bytes per row.</p>"
+      "<p class='muted'>Tip: use <a class='link' href='https://javl.github.io/image2cpp/' target='_blank'>image2cpp</a> with <b>Plain bytes</b>. Invert colors if needed.</p>"
+      "<form method='POST' action='/settings' accept-charset='UTF-8' style='margin-top:8px'>"
+      "<input type='hidden' name='sscfg' value='1'>"
+      "<input type='hidden' name='ssmulti' value='1'>"
+      "<div><label>Order</label>"
+      "<label style='display:flex;gap:10px;align-items:flex-start;margin-top:8px'><input type='radio' name='ssmode' value='cycle'";
+    out += ssmCycle;
+    out += "><span>Cycle in list order</span></label>"
+      "<label style='display:flex;gap:10px;align-items:flex-start;margin-top:8px'><input type='radio' name='ssmode' value='shuffle'";
+    out += ssmShuffle;
+    out += "><span>Shuffle</span></label>"
+      "</div>"
+      "<div class='actions'><button type='submit'>Save settings</button></div>"
+      "</form>"
+      "<form method='POST' action='/settings' accept-charset='UTF-8' style='margin-top:10px'>"
+      "<input type='hidden' name='sscfg' value='1'>"
+      "<div class='actions'><button type='submit'>Use single screensaver</button></div>"
+      "</form></div>";
+
+    out += "<div class='card'><h2>Screensaver files</h2>";
+
+    for (int i = 0; i < slotCount; i++) {
+      int slot = slotIds[i];
+      out += "<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--line-soft)'>";
+      out += "<img src='/sleep-thumb?slot=";
+      out += String(slot);
+      out += "' alt='slot ";
+      out += String(slot);
+      out += "' style='width:180px;height:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)'>";
+      out += "<form method='POST' action='/sleep-slot-remove'><input type='hidden' name='slot' value='";
+      out += String(slot);
+      out += "'><button type='submit' class='btn secondary' style='background:transparent;border:0;padding:0;color:var(--link)'>✕ Remove</button></form>";
+      out += "</div>";
+    }
+
+    String slotDisabled = (nextSlot < 0) ? " disabled" : "";
+    out += "<h2 style='margin-top:14px'>Add to rotation</h2>"
+      "<form method='POST' action='/upload-sleep-slot' enctype='multipart/form-data' onsubmit=\"var inp=this.elements['file'];if(!inp||!inp.files||!inp.files.length||!inp.files[0].size){alert('Please choose an image first.');return false;}return true;\">"
+      "<div class='grid'><div><input type='file' name='file' accept='.bin,.BIN,application/octet-stream,*/*'";
+    out += slotDisabled;
+    out += "></div></div>"
+      "<div class='actions'><button type='submit'";
+    out += slotDisabled;
+    out += ">Upload image</button></div></form>"
+      "</div>";
   } else {
-    out += "<div class='status idle'>Using built-in screensaver.</div>";
+    out += "<div class='card'><h2>Screensaver</h2>"
+      "<p>Images are raw XBM bytes: <b>3904 bytes</b>, 250&times;122 px, 1-bit, LSB-first, 32 bytes per row.</p>"
+      "<p class='muted'>Tip: use <a class='link' href='https://javl.github.io/image2cpp/' target='_blank'>image2cpp</a> with <b>Plain bytes</b>. Invert colors if needed.</p>";
+    if (hasSleepImg) {
+      out += "<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--line-soft)'>";
+      out += "<img src='/sleep-thumb?single=1' alt='single screensaver' style='width:180px;height:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)'>";
+      out += "<a class='link' href='/del-sleep' onclick=\"return confirm('Delete custom screensaver?')\">✕ Remove</a>";
+      out += "</div>";
+    } else {
+      out += "<div class='status idle'>Using built-in screensaver.</div>";
+    }
+    out +=
+      "<form method='POST' action='/upload-sleep' enctype='multipart/form-data' style='margin-top:14px' onsubmit=\"var inp=this.elements['file'];if(!inp||!inp.files||!inp.files.length||!inp.files[0].size){alert('Please choose an image first.');return false;}return true;\">"
+      "<div class='grid'><div><label for='file'>Single custom image</label><input id='file' type='file' name='file' accept='.bin'></div></div>"
+      "<div class='actions'><button type='submit'>Upload image</button></div>"
+      "</form>"
+      "<form method='POST' action='/settings' accept-charset='UTF-8' style='margin-top:10px'>"
+      "<input type='hidden' name='sscfg' value='1'>"
+      "<input type='hidden' name='ssmulti' value='1'>"
+      "<input type='hidden' name='ssmode' value='cycle'>"
+      "<div class='actions'><button type='submit'>Use multiple screensavers</button></div>"
+      "</form></div>";
   }
 
-  out +=
-    "<form method='POST' action='/upload-sleep' enctype='multipart/form-data' style='margin-top:14px'>"
-    "<div class='grid'><div><label for='file'>Sleep image file</label><input id='file' type='file' name='file' accept='.bin'></div></div>"
-    "<div class='actions'><button type='submit'>Upload image</button></div>"
-    "</form></div></div></body></html>";
+  out += screensaverEditorHtml(multiScreensaver, nextSlot >= 0);
 
+  out += "</div></body></html>";
+
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
   server.send(200, "text/html; charset=utf-8", out);
 }
 
 static void handleSettingsPost() {
   bool layoutChanged = false;
 
-  if (server.hasArg("font")) {
-    int fs = server.arg("font").toInt();
-    if (fs != 8 && fs != 10 && fs != 12 && fs != 14) fs = 10;
-    if (fs != g_settings.fontSize) {
-      applyFontSize(fs);
+  if (server.hasArg("font") || server.hasArg("readfont")) {
+    int fs = g_settings.fontSize;
+    if (server.hasArg("font")) {
+      fs = server.arg("font").toInt();
+      if (fs != 8 && fs != 10 && fs != 12 && fs != 14) fs = 10;
+    }
+    int rf = g_settings.readingFont;
+    if (server.hasArg("readfont")) {
+      rf = server.arg("readfont").toInt();
+      if (rf != 0 && rf != 1) rf = 0;
+    }
+    if (fs != g_settings.fontSize || rf != g_settings.readingFont) {
+      g_settings.readingFont = rf;
+      applyReaderFonts(fs);
       prefs.putInt("cfg_font", fs);
+      prefs.putInt("cfg_read_font", rf);
       layoutChanged = true;
     }
   }
@@ -3997,15 +5270,43 @@ static void handleSettingsPost() {
     }
   }
 
+  bool hasReadingSettingsArgs = server.hasArg("font") || server.hasArg("readfont") || server.hasArg("sleep") || server.hasArg("lgap") || server.hasArg("bionic");
+  if (hasReadingSettingsArgs) {
+    bool bionicEnabled = server.hasArg("bionic");
+    if (bionicEnabled != g_settings.bionicReading) {
+      g_settings.bionicReading = bionicEnabled;
+      prefs.putInt("cfg_bionic", bionicEnabled ? 1 : 0);
+      layoutChanged = true;
+    }
+  }
+
+  if (server.hasArg("sscfg")) {
+    bool multiEnabled = server.hasArg("ssmulti");
+    prefs.putInt("cfg_ss_multi", multiEnabled ? 1 : 0);
+
+    String m = server.arg("ssmode");
+    int newMode = (m == "shuffle" || m == "rnd") ? 1 : 0;
+    prefs.putInt("cfg_ss_mode", newMode);
+
+    if (server.hasArg("ssreset")) {
+      prefs.putUInt("cfg_sleep_ss_idx", 0);
+      prefs.putInt("cfg_ss_last_slot", -1);
+      saveSleepCycleIndex(0);
+    }
+  }
+
   if (layoutChanged) {
-    // invalidateAllPageCaches() already resets pageIndex to 0 for the open book.
-    // Call it BEFORE renderCurrentPage() so the page is redrawn from byte 0
-    // with the new font metrics -- not from the now-invalid old page number.
-    invalidateAllPageCaches();
+    if ((mode == MODE_READER || mode == MODE_BM_PREVIEW)
+        && g_reader.currentBookKey.length() > 0) {
+      uint32_t topOff = readerTopByteOffset();
+      prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), topOff);
+      saveProgressThrottled(true);
+    }
+    requestInvalidateAllPageCaches();
     if (mode == MODE_READER || mode == MODE_BM_PREVIEW) {
       g_bookmarkUi.previewActive = false; // exit preview on layout change
       mode = MODE_READER;
-      renderCurrentPage();
+      g_renderAfterLayoutInvalidate = true;
     }
   }
 
@@ -4016,6 +5317,99 @@ static void handleSettingsPost() {
 
 static void handleDeleteSleepImg() {
   if (FS.exists("/sleep.bin")) FS.remove("/sleep.bin");
+  prefs.putUInt("cfg_sleep_ss_idx", 0);
+  prefs.putInt("cfg_ss_last_slot", -1);
+  saveSleepCycleIndex(0);
+  server.sendHeader("Location", "/settings");
+  server.send(302, "text/plain", "");
+}
+
+static void handleSleepThumb() {
+  String p;
+  if (server.hasArg("single")) p = "/sleep.bin";
+  else {
+    int slot = parseSleepSlotArg(server.arg("slot"));
+    if (slot < 0) {
+      server.send(400, "text/plain; charset=utf-8", "Invalid slot");
+      return;
+    }
+    p = sleepSlotPath(slot);
+  }
+
+  File f = FS.open(p, "r");
+  if (!f || f.size() != SLEEP_FRAME_BYTES) {
+    if (f) f.close();
+    server.send(404, "text/plain; charset=utf-8", "Thumbnail not found");
+    return;
+  }
+
+  static uint8_t buf[SLEEP_FRAME_BYTES];
+  if (f.read(buf, SLEEP_FRAME_BYTES) != SLEEP_FRAME_BYTES) {
+    f.close();
+    server.send(500, "text/plain; charset=utf-8", "Read failed");
+    return;
+  }
+  f.close();
+
+  const int rowBytes = 32;
+  const int bmpHeader = 14 + 40 + 8;
+  const int imgBytes = rowBytes * SCREEN_H;
+  const int total = bmpHeader + imgBytes;
+
+  uint8_t fileHeader[14] = {
+    0x42, 0x4D,
+    (uint8_t)(total & 0xFF), (uint8_t)((total >> 8) & 0xFF), (uint8_t)((total >> 16) & 0xFF), (uint8_t)((total >> 24) & 0xFF),
+    0, 0, 0, 0,
+    (uint8_t)(bmpHeader & 0xFF), (uint8_t)((bmpHeader >> 8) & 0xFF), (uint8_t)((bmpHeader >> 16) & 0xFF), (uint8_t)((bmpHeader >> 24) & 0xFF)
+  };
+  uint8_t infoHeader[40] = {
+    40, 0, 0, 0,
+    (uint8_t)(SCREEN_W & 0xFF), (uint8_t)((SCREEN_W >> 8) & 0xFF), 0, 0,
+    (uint8_t)(SCREEN_H & 0xFF), (uint8_t)((SCREEN_H >> 8) & 0xFF), 0, 0,
+    1, 0,
+    1, 0,
+    0, 0, 0, 0,
+    (uint8_t)(imgBytes & 0xFF), (uint8_t)((imgBytes >> 8) & 0xFF), (uint8_t)((imgBytes >> 16) & 0xFF), (uint8_t)((imgBytes >> 24) & 0xFF),
+    0x13, 0x0B, 0, 0,
+    0x13, 0x0B, 0, 0,
+    2, 0, 0, 0,
+    0, 0, 0, 0
+  };
+  uint8_t palette[8] = {0, 0, 0, 0, 255, 255, 255, 0};
+
+  server.setContentLength(total);
+  server.send(200, "image/bmp", "");
+  WiFiClient client = server.client();
+  client.write(fileHeader, sizeof(fileHeader));
+  client.write(infoHeader, sizeof(infoHeader));
+  client.write(palette, sizeof(palette));
+
+  uint8_t row[rowBytes];
+  for (int y = SCREEN_H - 1; y >= 0; y--) {
+    const uint8_t* src = &buf[y * rowBytes];
+    for (int i = 0; i < rowBytes; i++) row[i] = reverseBits8(src[i]);
+    client.write(row, rowBytes);
+  }
+}
+
+static void handleSleepSlotRemove() {
+  int slot = parseSleepSlotArg(server.arg("slot"));
+  if (slot >= 0) {
+    String p = sleepSlotPath(slot);
+    if (FS.exists(p)) FS.remove(p);
+  }
+  prefs.putUInt("cfg_sleep_ss_idx", 0);
+  prefs.putInt("cfg_ss_last_slot", -1);
+  saveSleepCycleIndex(0);
+  server.sendHeader("Location", "/settings");
+  server.send(302, "text/plain", "");
+}
+
+static void handleUploadSleepSlotDone() {
+  if (!g_upload.sleepOk) {
+    server.send(400, "text/plain; charset=utf-8", g_upload.sleepError.length() ? g_upload.sleepError : "Sleep slot upload failed");
+    return;
+  }
   server.sendHeader("Location", "/settings");
   server.send(302, "text/plain", "");
 }
@@ -4028,7 +5422,7 @@ static void handleUploadSleepDone() {
 
   String inner;
   inner.reserve(500);
-  inner += "<div class='card'><h2>Screensaver updated</h2><p class='muted'>Your custom sleep image was saved successfully and will be shown the next time the device goes to sleep.</p><div class='actions'><a class='btn' href='/settings'>Back to settings</a><a class='btn secondary' href='/'>Home</a></div></div>";
+  inner += "<div class='card'><h2>Screensaver updated</h2><p class='muted'>Your custom sleep image (or multi-frame pack) was saved successfully. The next sleep will show the first frame; multiple frames rotate in order on each sleep.</p><div class='actions'><a class='btn' href='/settings'>Back to settings</a><a class='btn secondary' href='/'>Home</a></div></div>";
 
   String page = successPage(
     "Upload complete",
@@ -4167,7 +5561,20 @@ static void handleUploadSleepStream() {
   if (upS.status == UPLOAD_FILE_START) {
     g_upload.sleepOk = false;
     g_upload.sleepError = "";
-    g_upload.sleepTmpPath = "/sleep.bin.tmp";
+    g_upload.sleepSlotUpload = (server.uri() == "/upload-sleep-slot");
+    g_upload.sleepSlotTarget = -1;
+    if (g_upload.sleepSlotUpload) {
+      int requested = parseSleepSlotArg(server.arg("slot"));
+      if (requested < 0) requested = firstFreeSleepSlot();
+      if (requested < 0) {
+        g_upload.sleepError = "No free rotation slot";
+        return;
+      }
+      g_upload.sleepSlotTarget = requested;
+      g_upload.sleepTmpPath = "/sleep-slot.tmp";
+    } else {
+      g_upload.sleepTmpPath = "/sleep.bin.tmp";
+    }
     if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
     g_upload.sleepTmpFile = FS.open(g_upload.sleepTmpPath, "w");
     if (!g_upload.sleepTmpFile) g_upload.sleepError = "Cannot create temp sleep file";
@@ -4181,19 +5588,55 @@ static void handleUploadSleepStream() {
     size_t sz = f ? f.size() : 0;
     if (f) f.close();
 
-    if (sz != 3904) {
-      if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-      g_upload.sleepError = "Sleep image must be exactly 3904 bytes";
-      g_upload.sleepOk = false;
-    } else {
-      if (FS.exists("/sleep.bin")) FS.remove("/sleep.bin");
-      if (FS.rename(g_upload.sleepTmpPath, "/sleep.bin")) g_upload.sleepOk = true;
-      else {
+    if (g_upload.sleepSlotUpload) {
+      if (sz != SLEEP_FRAME_BYTES) {
         if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-        g_upload.sleepError = "Failed to save sleep image";
+        g_upload.sleepError = (sz == 0)
+          ? "Please choose an image first."
+          : "Rotation image must be exactly 3904 bytes";
+        g_upload.sleepOk = false;
+      } else if (g_upload.sleepSlotTarget < 0 || g_upload.sleepSlotTarget >= MAX_MULTI_SLEEP_SLOTS) {
+        if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
+        g_upload.sleepError = "Invalid rotation slot";
+        g_upload.sleepOk = false;
+      } else {
+        String dst = sleepSlotPath(g_upload.sleepSlotTarget);
+        if (FS.exists(dst)) FS.remove(dst);
+        if (FS.rename(g_upload.sleepTmpPath, dst)) {
+          g_upload.sleepOk = true;
+          prefs.putUInt("cfg_sleep_ss_idx", 0);
+          prefs.putInt("cfg_ss_last_slot", -1);
+          saveSleepCycleIndex(0);
+        } else {
+          if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
+          g_upload.sleepError = "Failed to save rotation image";
+        }
+      }
+    } else {
+      if (sz < SLEEP_FRAME_BYTES || (sz % SLEEP_FRAME_BYTES) != 0) {
+        if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
+        g_upload.sleepError = (sz == 0)
+          ? "Please choose an image first."
+          : "Sleep image must be 3904 bytes or a whole multiple (concatenated frames)";
+        g_upload.sleepOk = false;
+      } else if ((int)(sz / SLEEP_FRAME_BYTES) > MAX_SLEEP_FRAMES) {
+        if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
+        g_upload.sleepError = "Too many screensaver frames (maximum is 16)";
+        g_upload.sleepOk = false;
+      } else {
+        if (FS.exists("/sleep.bin")) FS.remove("/sleep.bin");
+        if (FS.rename(g_upload.sleepTmpPath, "/sleep.bin")) {
+          g_upload.sleepOk = true;
+          prefs.putUInt("cfg_sleep_ss_idx", 0);
+        } else {
+          if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
+          g_upload.sleepError = "Failed to save sleep image";
+        }
       }
     }
     g_upload.sleepTmpPath = "";
+    g_upload.sleepSlotUpload = false;
+    g_upload.sleepSlotTarget = -1;
   }
   else if (upS.status == UPLOAD_FILE_ABORTED) {
     if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.close();
@@ -4201,6 +5644,8 @@ static void handleUploadSleepStream() {
     g_upload.sleepError = "Sleep image upload aborted";
     g_upload.sleepOk = false;
     g_upload.sleepTmpPath = "";
+    g_upload.sleepSlotUpload = false;
+    g_upload.sleepSlotTarget = -1;
   }
 }
 
@@ -4312,6 +5757,11 @@ static void registerWebRoutes() {
   server.on("/mkdir", HTTP_POST, handleCreateFolder);
   server.on("/move", HTTP_POST, handleMoveBook);
   server.on("/jumppage", HTTP_POST, handleJumpPageWeb);
+  server.on("/read", HTTP_GET, handleReadBookWeb);
+  server.on("/readbook-text", HTTP_GET, handleReadBookTextWeb);
+  server.on("/readbook-page-offset", HTTP_GET, handleReadBookPageOffsetWeb);
+  server.on("/readbook-max-progress", HTTP_GET, handleReadBookMaxProgressWeb);
+  server.on("/jumpoffset", HTTP_POST, handleJumpOffsetWeb);
   server.on("/list", HTTP_GET, handleListWeb);
   server.on("/list", HTTP_POST, handleListSaveWeb);
   server.on("/list-clear-done", HTTP_POST, handleListClearDoneWeb);
@@ -4328,13 +5778,19 @@ static void registerWebRoutes() {
   server.on("/settings", HTTP_GET, handleSettings);
   server.on("/settings", HTTP_POST, handleSettingsPost);
   server.on("/del-sleep", HTTP_GET, handleDeleteSleepImg);
+  server.on("/sleep-thumb", HTTP_GET, handleSleepThumb);
+  server.on("/sleep-slot-remove", HTTP_POST, handleSleepSlotRemove);
 
   server.on("/upload-sleep", HTTP_POST, handleUploadSleepDone, handleUploadSleepStream);
+  server.on("/upload-sleep-slot", HTTP_POST, handleUploadSleepSlotDone, handleUploadSleepStream);
   server.on("/upload-app",   HTTP_POST, handleUploadAppDone,   handleUploadAppStream);
   server.on("/upload", HTTP_POST, handleUploadDone, handleUploadBookStream);
 }
 
 static void startUploadMode() {
+  if (mode == MODE_READER && g_reader.currentBookKey.length() > 0) {
+    saveProgressThrottled(true);
+  }
   mode = MODE_UPLOAD;
   g_upload.startedMs = millis();
 
@@ -4406,6 +5862,8 @@ static void stopUploadModeToLibrary() {
   g_upload.sleepOk = false;
   g_upload.sleepError = "";
   g_upload.sleepTmpPath = "";
+  g_upload.sleepSlotUpload = false;
+  g_upload.sleepSlotTarget = -1;
 
   g_upload.appOk = false;
   g_upload.appError = "";
@@ -4427,15 +5885,74 @@ static void drawSleepScreen() {
   display.clear();
   beginPageCanvas();
 
-  File sf = FS.open("/sleep.bin", "r");
-  if (sf && sf.size() >= 3904) {
-    static uint8_t sleepBuf[3904];
-    sf.read(sleepBuf, 3904);
-    sf.close();
-    gfx.fillScreen(1);
-    gfx.drawXBitmap(0, 0, sleepBuf, SCREEN_W, SCREEN_H, 0);
-  } else {
-    if (sf) sf.close();
+  bool drewCustom = false;
+
+  bool multiEnabled = (prefs.getInt("cfg_ss_multi", 0) == 1);
+  int slots[MAX_MULTI_SLEEP_SLOTS];
+  int slotCount = collectSleepSlots(slots);
+  if (multiEnabled && slotCount > 0) {
+    int sleepMode = prefs.getInt("cfg_ss_mode", 0);
+    if (sleepMode != 1) sleepMode = 0; // 0=cycle, 1=shuffle
+
+    int slotPick = slots[0];
+    if (sleepMode == 1) {
+      int lastSlot = prefs.getInt("cfg_ss_last_slot", -1);
+      if (slotCount <= 1) {
+        slotPick = slots[0];
+      } else {
+        int guard = 12;
+        do {
+          slotPick = slots[(int)(esp_random() % (uint32_t)slotCount)];
+          guard--;
+        } while (slotPick == lastSlot && guard > 0);
+      }
+      prefs.putInt("cfg_ss_last_slot", slotPick);
+    } else {
+      // Cycle mode: drive from a small persisted index file to guarantee
+      // advancement across deep-sleep restarts on all boards.
+      int idx = loadSleepCycleIndex();
+      if (idx < 0) idx = 0;
+      slotPick = slots[idx % slotCount];
+      int nextIdx = (idx + 1) % slotCount;
+      saveSleepCycleIndex(nextIdx);
+      prefs.putInt("cfg_ss_last_slot", slotPick);
+    }
+
+    File mf = FS.open(sleepSlotPath(slotPick), "r");
+    if (mf && mf.size() == SLEEP_FRAME_BYTES) {
+      static uint8_t sleepBuf[SLEEP_FRAME_BYTES];
+      if (mf.read(sleepBuf, SLEEP_FRAME_BYTES) == SLEEP_FRAME_BYTES) {
+        gfx.fillScreen(1);
+        gfx.drawXBitmap(0, 0, sleepBuf, SCREEN_W, SCREEN_H, 0);
+        drewCustom = true;
+      }
+    }
+    if (mf) mf.close();
+  }
+
+  if (!drewCustom) {
+    File sf = FS.open("/sleep.bin", "r");
+    if (sf) {
+      size_t sz = sf.size();
+      if (sz >= SLEEP_FRAME_BYTES && (sz % SLEEP_FRAME_BYTES) == 0) {
+        int numFrames = (int)(sz / SLEEP_FRAME_BYTES);
+        if (numFrames >= 1 && numFrames <= MAX_SLEEP_FRAMES) {
+          uint32_t idx = prefs.getUInt("cfg_sleep_ss_idx", 0) % (uint32_t)numFrames;
+          static uint8_t sleepBuf[SLEEP_FRAME_BYTES];
+          if (sf.seek(idx * SLEEP_FRAME_BYTES, SeekSet) &&
+              sf.read(sleepBuf, SLEEP_FRAME_BYTES) == SLEEP_FRAME_BYTES) {
+            prefs.putUInt("cfg_sleep_ss_idx", idx + 1);
+            gfx.fillScreen(1);
+            gfx.drawXBitmap(0, 0, sleepBuf, SCREEN_W, SCREEN_H, 0);
+            drewCustom = true;
+          }
+        }
+      }
+      sf.close();
+    }
+  }
+
+  if (!drewCustom) {
     gfx.fillScreen(1);
     gfx.drawXBitmap(0, 0, pala_one_sleep_black_icon_v4_bits, SCREEN_W, SCREEN_H, 0);
   }
@@ -4875,6 +6392,7 @@ static void idlePrefetchReader() {
 
 void loop() {
   btns.poll();
+  tickInvalidateAllPageCaches();
 
   if (g_isrDropCount > BTN_QUEUE_RECOVER_THRESHOLD) {
     noInterrupts();
